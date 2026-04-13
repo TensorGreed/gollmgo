@@ -140,4 +140,43 @@ __global__ void bf16_to_f16(
     __half* __restrict__ out,
     int total_elements);
 
+/* ======== Mixed-precision kernels (FP32 hidden state) ======== */
+
+/* Embedding: half-precision table → FP32 output */
+__global__ void embedding_f16_to_f32(
+    const __half* __restrict__ table,
+    const int32_t* __restrict__ ids,
+    float* __restrict__ out,
+    int hidden_size, int vocab_size);
+
+__global__ void embedding_bf16_to_f32(
+    const __nv_bfloat16* __restrict__ table,
+    const int32_t* __restrict__ ids,
+    float* __restrict__ out,
+    int hidden_size, int vocab_size);
+
+/* RMSNorm: FP32 input, half-precision weight → half-precision output (for GEMM) */
+__global__ void rmsnorm_f32in_f16w(
+    const float* __restrict__ x,
+    const __half* __restrict__ weight,
+    __half* __restrict__ out,
+    int hidden_size, int n, float eps);
+
+__global__ void rmsnorm_f32in_bf16w(
+    const float* __restrict__ x,
+    const __nv_bfloat16* __restrict__ weight,
+    __nv_bfloat16* __restrict__ out,
+    int hidden_size, int n, float eps);
+
+/* Residual add: FP32 accumulator += half-precision input → FP32 output */
+__global__ void residual_add_f32_f16(
+    float* __restrict__ acc,
+    const __half* __restrict__ b,
+    int total_elements);
+
+__global__ void residual_add_f32_bf16(
+    float* __restrict__ acc,
+    const __nv_bfloat16* __restrict__ b,
+    int total_elements);
+
 #endif /* GOLLMGO_OPS_CUH */

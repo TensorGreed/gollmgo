@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"math"
 	"os"
 	"testing"
 )
@@ -102,5 +103,149 @@ func TestGGUFLoaderMissingFile(t *testing.T) {
 	_, err := loader.Load(context.Background(), "/nonexistent/model.gguf")
 	if err == nil {
 		t.Fatal("expected error for missing file")
+	}
+}
+
+// writeGGUFv3WithTensors builds a GGUF v3 file with metadata and F32 tensor data.
+func writeGGUFv3WithTensors(t *testing.T, kv map[string]any, tensors []struct {
+	name  string
+	shape []uint64
+	dtype uint32
+	data  []byte
+}) string {
+	t.Helper()
+	var buf bytes.Buffer
+
+	binary.Write(&buf, binary.LittleEndian, uint32(ggufMagic))
+	binary.Write(&buf, binary.LittleEndian, uint32(3))
+	binary.Write(&buf, binary.LittleEndian, uint64(len(tensors)))
+	binary.Write(&buf, binary.LittleEndian, uint64(len(kv)))
+
+	for key, val := range kv {
+		writeGGUFTestString(&buf, key)
+		switch v := val.(type) {
+		case string:
+			binary.Write(&buf, binary.LittleEndian, uint32(ggufTypeString))
+			writeGGUFTestString(&buf, v)
+		case uint32:
+			binary.Write(&buf, binary.LittleEndian, uint32(ggufTypeUint32))
+			binary.Write(&buf, binary.LittleEndian, v)
+		}
+	}
+
+	// Tensor descriptors — offsets relative to data section start.
+	offset := uint64(0)
+	for _, tensor := range tensors {
+		writeGGUFTestString(&buf, tensor.name)
+		binary.Write(&buf, binary.LittleEndian, uint32(len(tensor.shape)))
+		for _, d := range tensor.shape {
+			binary.Write(&buf, binary.LittleEndian, d)
+		}
+		binary.Write(&buf, binary.LittleEndian, tensor.dtype)
+		binary.Write(&buf, binary.LittleEndian, offset)
+		offset += uint64(len(tensor.data))
+	}
+
+	// Align to 32 bytes.
+	for buf.Len()%32 != 0 {
+		buf.WriteByte(0)
+	}
+
+	// Tensor data.
+	for _, tensor := range tensors {
+		buf.Write(tensor.data)
+	}
+
+	path := t.TempDir() + "/model.gguf"
+	if err := os.WriteFile(path, buf.Bytes(), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestLoadGGUFWeights(t *testing.T) {
+	// Create a minimal GGUF file with 2 F32 tensors.
+	tensorData1 := make([]byte, 4*4) // [4] F32
+	tensorData2 := make([]byte, 2*3*4) // [2,3] F32
+	// Write known values.
+	for i := 0; i < 4; i++ {
+		binary.LittleEndian.PutUint32(tensorData1[i*4:], math.Float32bits(float32(i+1)))
+	}
+	for i := 0; i < 6; i++ {
+		binary.LittleEndian.PutUint32(tensorData2[i*4:], math.Float32bits(float32(10+i)))
+	}
+
+	path := writeGGUFv3WithTensors(t, map[string]any{
+		"general.architecture":          "llama",
+		"general.name":                  "test",
+		"llama.block_count":             uint32(2),
+		"llama.embedding_length":        uint32(64),
+		"llama.attention.head_count":    uint32(4),
+		"llama.attention.head_count_kv": uint32(4),
+		"llama.context_length":          uint32(512),
+	}, []struct {
+		name  string
+		shape []uint64
+		dtype uint32
+		data  []byte
+	}{
+		{name: "weight_a", shape: []uint64{4}, dtype: ggufDTypeF32, data: tensorData1},
+		{name: "weight_b", shape: []uint64{2, 3}, dtype: ggufDTypeF32, data: tensorData2},
+	})
+
+	tensors, meta, err := LoadGGUFWeights(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Family != "llama" {
+		t.Fatalf("expected llama, got %q", meta.Family)
+	}
+	if meta.NumLayers != 2 {
+		t.Fatalf("expected 2 layers, got %d", meta.NumLayers)
+	}
+	if len(tensors) != 2 {
+		t.Fatalf("expected 2 tensors, got %d", len(tensors))
+	}
+
+	// Verify first tensor.
+	if tensors[0].Name != "weight_a" {
+		t.Fatalf("expected weight_a, got %q", tensors[0].Name)
+	}
+	if tensors[0].Dtype != "F32" {
+		t.Fatalf("expected F32 dtype, got %q", tensors[0].Dtype)
+	}
+	if len(tensors[0].Data) != 16 {
+		t.Fatalf("expected 16 bytes, got %d", len(tensors[0].Data))
+	}
+	v := math.Float32frombits(binary.LittleEndian.Uint32(tensors[0].Data[0:4]))
+	if v != 1.0 {
+		t.Fatalf("expected first value 1.0, got %f", v)
+	}
+
+	// Verify second tensor.
+	if tensors[1].Name != "weight_b" {
+		t.Fatalf("expected weight_b, got %q", tensors[1].Name)
+	}
+	if len(tensors[1].Shape) != 2 || tensors[1].Shape[0] != 2 || tensors[1].Shape[1] != 3 {
+		t.Fatalf("expected shape [2,3], got %v", tensors[1].Shape)
+	}
+}
+
+func TestLoadGGUFWeightsQuantizedError(t *testing.T) {
+	// Q4_0 tensors should be rejected.
+	path := writeGGUFv3WithTensors(t, map[string]any{
+		"general.architecture": "llama",
+	}, []struct {
+		name  string
+		shape []uint64
+		dtype uint32
+		data  []byte
+	}{
+		{name: "quant_weight", shape: []uint64{4}, dtype: ggufDTypeQ4_0, data: make([]byte, 20)},
+	})
+
+	_, _, err := LoadGGUFWeights(path)
+	if err == nil {
+		t.Fatal("expected error for quantized tensor")
 	}
 }

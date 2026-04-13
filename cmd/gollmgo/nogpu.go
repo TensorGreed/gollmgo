@@ -7,9 +7,10 @@ import (
 	"log/slog"
 
 	"github.com/TensorGreed/gollmgo/internal/backend"
+	"github.com/TensorGreed/gollmgo/internal/config"
 	"github.com/TensorGreed/gollmgo/internal/model"
 )
 
-func initGPURunner(_ *slog.Logger, modelPath, _ string, _ int) (backend.Runner, model.Tokenizer, error) {
-	return nil, nil, fmt.Errorf("GPU support not compiled (build with -tags gpu). model path: %s", modelPath)
+func initGPURunner(_ *slog.Logger, cfg config.Config, _ int) (backend.Runner, model.Tokenizer, int, error) {
+	return nil, nil, 0, fmt.Errorf("GPU support not compiled (build with -tags gpu). model path: %s", cfg.ModelPath)
 }

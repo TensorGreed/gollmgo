@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"flag"
@@ -10,7 +11,10 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
+	"sort"
+	"strings"
 	"syscall"
 	"time"
 
@@ -93,9 +97,10 @@ func cmdServe(args []string) {
 	var runner backend.Runner
 	var tokenizer model.Tokenizer
 
+	numBlocks := 1024 // default for mock mode
 	if cfg.ModelPath != "" {
 		var err error
-		runner, tokenizer, err = initGPURunner(log, cfg.ModelPath, cfg.TokenizerPath, *deviceID)
+		runner, tokenizer, numBlocks, err = initGPURunner(log, cfg, *deviceID)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "GPU init failed: %v\n", err)
 			os.Exit(1)
@@ -111,10 +116,10 @@ func cmdServe(args []string) {
 		"host", cfg.Host,
 		"port", cfg.Port,
 		"max_batch_size", cfg.MaxBatchSize,
-		"block_size", cfg.BlockSize)
+		"block_size", cfg.BlockSize,
+		"kv_blocks", numBlocks)
 
-	// Create KV cache pool.
-	numBlocks := 1024 // TODO: compute from available GPU memory
+	// Create Go-side KV cache pool matching the GPU-side allocation.
 	cache := kvcache.NewBlockPool(numBlocks, cfg.BlockSize)
 
 	// Create scheduler.
@@ -162,6 +167,13 @@ func cmdServe(args []string) {
 
 	eng.Stop()
 	srv.Shutdown(shutdownCtx)
+
+	// Release GPU resources (model, KV cache, backend handle).
+	if runner != nil {
+		if err := runner.Close(); err != nil {
+			log.Error("runner close error", "error", err)
+		}
+	}
 	log.Info("shutdown complete")
 }
 
@@ -265,6 +277,9 @@ func runOfflineBench(log *slog.Logger, numPrompts, promptLen, outputLen int) {
 
 	// Print results.
 	result := BenchResult{
+		Timestamp:       time.Now().UTC().Format(time.RFC3339),
+		GitSHA:          getGitSHA(),
+		Hardware:        "DGX Spark GB10",
 		Mode:            "offline",
 		NumPrompts:      completed,
 		PromptLen:       promptLen,
@@ -275,6 +290,7 @@ func runOfflineBench(log *slog.Logger, numPrompts, promptLen, outputLen int) {
 	}
 	data, _ := json.MarshalIndent(result, "", "  ")
 	fmt.Println(string(data))
+	saveBenchResult(result, data)
 }
 
 func runServingBench(log *slog.Logger, targetURL string, numPrompts, promptLen, outputLen, concurrency int) {
@@ -286,9 +302,11 @@ func runServingBench(log *slog.Logger, targetURL string, numPrompts, promptLen, 
 		"concurrency", concurrency)
 
 	type requestResult struct {
-		ttft    time.Duration
-		total   time.Duration
-		tokens  int
+		ttft   time.Duration   // time to first content token (from streaming SSE)
+		e2e    time.Duration   // total request duration
+		itls   []time.Duration // inter-token latencies
+		tokens int
+		err    bool
 	}
 
 	results := make(chan requestResult, numPrompts)
@@ -302,13 +320,12 @@ func runServingBench(log *slog.Logger, targetURL string, numPrompts, promptLen, 
 		go func(idx int) {
 			defer func() { <-sem }()
 
-			// Build a simple prompt.
 			prompt := fmt.Sprintf("Prompt number %d. Please continue writing about topic %d.", idx, idx%10)
 
 			payload := map[string]any{
 				"model":      "gollmgo-default",
 				"max_tokens": outputLen,
-				"stream":     false,
+				"stream":     true,
 				"messages": []map[string]string{
 					{"role": "user", "content": prompt},
 				},
@@ -320,20 +337,50 @@ func runServingBench(log *slog.Logger, targetURL string, numPrompts, promptLen, 
 				io.NopCloser(io.NewSectionReader(newBytesReader(body), 0, int64(len(body)))))
 			if err != nil {
 				log.Error("request failed", "error", err)
+				results <- requestResult{err: true}
 				return
 			}
-			// For non-streaming, the response headers arrive when
-			// the server starts writing. This is approximately TTFT.
-			headerTime := time.Since(reqStart)
-			io.ReadAll(resp.Body)
-			resp.Body.Close()
-			total := time.Since(reqStart)
+			defer resp.Body.Close()
 
-			results <- requestResult{ttft: headerTime, total: total, tokens: outputLen}
+			// Parse SSE stream to measure real TTFT and per-token ITL.
+			var ttft time.Duration
+			var itls []time.Duration
+			tokens := 0
+			lastTokenTime := reqStart
+			firstContent := true
+
+			scanner := bufio.NewScanner(resp.Body)
+			for scanner.Scan() {
+				line := scanner.Text()
+				if !strings.HasPrefix(line, "data: ") {
+					continue
+				}
+				data := strings.TrimPrefix(line, "data: ")
+				if data == "[DONE]" {
+					break
+				}
+
+				// Check if this chunk has content (skip role-only chunks).
+				if !strings.Contains(data, `"content"`) {
+					continue
+				}
+
+				now := time.Now()
+				tokens++
+				if firstContent {
+					ttft = now.Sub(reqStart)
+					firstContent = false
+				} else {
+					itls = append(itls, now.Sub(lastTokenTime))
+				}
+				lastTokenTime = now
+			}
+			e2e := time.Since(reqStart)
+			results <- requestResult{ttft: ttft, e2e: e2e, itls: itls, tokens: tokens}
 		}(i)
 	}
 
-	// Wait for all.
+	// Wait for all goroutines.
 	for i := 0; i < concurrency; i++ {
 		sem <- struct{}{}
 	}
@@ -341,37 +388,70 @@ func runServingBench(log *slog.Logger, targetURL string, numPrompts, promptLen, 
 
 	elapsed := time.Since(start)
 
-	var totalTTFT, totalDuration time.Duration
-	var count int
+	// Collect and compute stats.
+	var ttfts, e2es, allITLs []float64
+	totalTokens := 0
+	errorCount := 0
 	for r := range results {
-		totalTTFT += r.ttft
-		totalDuration += r.total
-		count++
+		if r.err {
+			errorCount++
+			continue
+		}
+		ttfts = append(ttfts, float64(r.ttft.Microseconds())/1000.0)
+		e2es = append(e2es, float64(r.e2e.Microseconds())/1000.0)
+		totalTokens += r.tokens
+		for _, itl := range r.itls {
+			allITLs = append(allITLs, float64(itl.Microseconds())/1000.0)
+		}
 	}
 
+	count := len(ttfts)
 	if count == 0 {
 		fmt.Fprintln(os.Stderr, "no successful requests")
 		return
 	}
 
+	sort.Float64s(ttfts)
+	sort.Float64s(e2es)
+	sort.Float64s(allITLs)
+
+	gitSHA := getGitSHA()
+
 	result := BenchResult{
+		Timestamp:       time.Now().UTC().Format(time.RFC3339),
+		GitSHA:          gitSHA,
+		Hardware:        "DGX Spark GB10",
 		Mode:            "serving",
 		NumPrompts:      numPrompts,
 		PromptLen:       promptLen,
 		OutputLen:       outputLen,
 		Concurrency:     concurrency,
 		ElapsedSeconds:  elapsed.Seconds(),
-		TokensPerSecond: float64(count*outputLen) / elapsed.Seconds(),
+		TokensPerSecond: float64(totalTokens) / elapsed.Seconds(),
 		RequestsPerSec:  float64(count) / elapsed.Seconds(),
-		AvgResponseMs:   float64(totalTTFT.Milliseconds()) / float64(count),
-		AvgLatencyMs:    float64(totalDuration.Milliseconds()) / float64(count),
+		ErrorCount:      errorCount,
+		TTFTP50Ms:       percentile(ttfts, 0.50),
+		TTFTP95Ms:       percentile(ttfts, 0.95),
+		TTFTP99Ms:       percentile(ttfts, 0.99),
+		E2EP50Ms:        percentile(e2es, 0.50),
+		E2EP95Ms:        percentile(e2es, 0.95),
+		E2EP99Ms:        percentile(e2es, 0.99),
+		ITLP50Ms:        percentile(allITLs, 0.50),
+		ITLP95Ms:        percentile(allITLs, 0.95),
+		ITLP99Ms:        percentile(allITLs, 0.99),
 	}
 	data, _ := json.MarshalIndent(result, "", "  ")
 	fmt.Println(string(data))
+
+	// Save to bench/results/.
+	saveBenchResult(result, data)
 }
 
-// BenchResult holds benchmark output.
+// BenchResult holds benchmark output per docs/benchmarks.md.
 type BenchResult struct {
+	Timestamp       string  `json:"timestamp"`
+	GitSHA          string  `json:"git_sha"`
+	Hardware        string  `json:"hardware"`
 	Mode            string  `json:"mode"`
 	NumPrompts      int     `json:"num_prompts"`
 	PromptLen       int     `json:"prompt_len"`
@@ -380,10 +460,44 @@ type BenchResult struct {
 	ElapsedSeconds  float64 `json:"elapsed_seconds"`
 	TokensPerSecond float64 `json:"tokens_per_second"`
 	RequestsPerSec  float64 `json:"requests_per_second"`
-	// AvgResponseMs is the average time from request start to response
-	// headers (non-streaming). For streaming, this would be true TTFT.
-	AvgResponseMs   float64 `json:"avg_response_ms,omitempty"`
-	AvgLatencyMs    float64 `json:"avg_latency_ms,omitempty"`
+	ErrorCount      int     `json:"error_count"`
+	TTFTP50Ms       float64 `json:"ttft_p50_ms"`
+	TTFTP95Ms       float64 `json:"ttft_p95_ms"`
+	TTFTP99Ms       float64 `json:"ttft_p99_ms"`
+	E2EP50Ms        float64 `json:"e2e_p50_ms"`
+	E2EP95Ms        float64 `json:"e2e_p95_ms"`
+	E2EP99Ms        float64 `json:"e2e_p99_ms"`
+	ITLP50Ms        float64 `json:"itl_p50_ms"`
+	ITLP95Ms        float64 `json:"itl_p95_ms"`
+	ITLP99Ms        float64 `json:"itl_p99_ms"`
+}
+
+func percentile(sorted []float64, p float64) float64 {
+	if len(sorted) == 0 {
+		return 0
+	}
+	idx := int(float64(len(sorted)-1) * p)
+	if idx >= len(sorted) {
+		idx = len(sorted) - 1
+	}
+	return sorted[idx]
+}
+
+func getGitSHA() string {
+	out, err := exec.Command("git", "rev-parse", "--short", "HEAD").Output()
+	if err != nil {
+		return "unknown"
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func saveBenchResult(result BenchResult, data []byte) {
+	dir := "bench/results"
+	os.MkdirAll(dir, 0755)
+	filename := fmt.Sprintf("%s/%s_%s_%s.json",
+		dir, result.Mode, result.Timestamp[:10],
+		strings.ReplaceAll(result.Timestamp[11:19], ":", ""))
+	os.WriteFile(filename, data, 0644)
 }
 
 func cmdDoctor(_ []string) {

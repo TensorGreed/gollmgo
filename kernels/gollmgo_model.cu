@@ -37,10 +37,11 @@ struct gollmgo_model {
     /* Named weight tensors on device. */
     std::unordered_map<std::string, weight_tensor> weights;
 
-    /* Scratch buffers — void* for dtype-agnostic allocation.
-     * Element size is 2 bytes for both FP16 and BF16. */
-    void* buf_hidden;       /* [max_batch, hidden_size] */
-    void* buf_norm;         /* [max_batch, hidden_size] */
+    /* Scratch buffers.
+     * buf_hidden is FP32 to prevent precision loss across layers.
+     * All other activation buffers are in the model's native dtype (2 bytes). */
+    float* buf_hidden;      /* [max_batch, hidden_size] — FP32 accumulator */
+    void* buf_norm;         /* [max_batch, hidden_size] — half-precision for GEMM */
     void* buf_q;            /* [max_batch, num_heads * head_dim] */
     void* buf_k;            /* [max_batch, num_kv_heads * head_dim] */
     void* buf_v;            /* [max_batch, num_kv_heads * head_dim] */
@@ -267,7 +268,10 @@ gollmgo_status_t gollmgo_model_ready(gollmgo_model_t m) {
         if (st != GOLLMGO_OK) return st; \
     } while(0)
 
-    ALLOC_BUF(m->buf_hidden,      max_n * c.hidden_size);
+    /* buf_hidden is FP32 (4 bytes per element). */
+    st = model_check_cuda(m, cudaMalloc((void**)&m->buf_hidden,
+                                         (size_t)max_n * c.hidden_size * sizeof(float)));
+    if (st != GOLLMGO_OK) return st;
     ALLOC_BUF(m->buf_norm,        max_n * c.hidden_size);
     ALLOC_BUF(m->buf_q,           max_n * c.num_heads * c.head_dim);
     ALLOC_BUF(m->buf_k,           max_n * c.num_kv_heads * c.head_dim);
@@ -310,11 +314,12 @@ static gollmgo_status_t run_layer(gollmgo_model_t m, int layer, int N,
 
     {
         int threads = (c.hidden_size < 256) ? c.hidden_size : 256;
+        /* FP32 hidden → half-precision norm output for GEMM. */
         if (bf16)
-            rmsnorm_bf16<<<N, threads>>>(AS_CBF16(m->buf_hidden), AS_CBF16(norm_weight),
+            rmsnorm_f32in_bf16w<<<N, threads>>>(m->buf_hidden, AS_CBF16(norm_weight),
                 AS_BF16(m->buf_norm), c.hidden_size, N, c.rms_norm_eps);
         else
-            rmsnorm_f16<<<N, threads>>>(AS_CF16(m->buf_hidden), AS_CF16(norm_weight),
+            rmsnorm_f32in_f16w<<<N, threads>>>(m->buf_hidden, AS_CF16(norm_weight),
                 AS_F16(m->buf_norm), c.hidden_size, N, c.rms_norm_eps);
     }
 
@@ -412,17 +417,17 @@ static gollmgo_status_t run_layer(gollmgo_model_t m, int layer, int N,
     st = gemm(m, m->buf_attn_out, wo, m->buf_proj, N, c.hidden_size, c.num_heads * c.head_dim);
     if (st != GOLLMGO_OK) return st;
 
-    /* Residual add: hidden = hidden + proj. */
+    /* Residual add: FP32 hidden += half-precision proj. */
     {
         int total = N * c.hidden_size;
         int threads = 256;
         int blocks = (total + threads - 1) / threads;
         if (bf16)
-            residual_add_bf16<<<blocks, threads>>>(AS_CBF16(m->buf_hidden),
-                AS_CBF16(m->buf_proj), AS_BF16(m->buf_hidden), total);
+            residual_add_f32_bf16<<<blocks, threads>>>(m->buf_hidden,
+                AS_CBF16(m->buf_proj), total);
         else
-            residual_add_f16<<<blocks, threads>>>(AS_CF16(m->buf_hidden),
-                AS_CF16(m->buf_proj), AS_F16(m->buf_hidden), total);
+            residual_add_f32_f16<<<blocks, threads>>>(m->buf_hidden,
+                AS_CF16(m->buf_proj), total);
     }
 
     /* -- FFN block -- */
@@ -435,10 +440,10 @@ static gollmgo_status_t run_layer(gollmgo_model_t m, int layer, int N,
     {
         int threads = (c.hidden_size < 256) ? c.hidden_size : 256;
         if (bf16)
-            rmsnorm_bf16<<<N, threads>>>(AS_CBF16(m->buf_hidden), AS_CBF16(norm_weight),
+            rmsnorm_f32in_bf16w<<<N, threads>>>(m->buf_hidden, AS_CBF16(norm_weight),
                 AS_BF16(m->buf_norm), c.hidden_size, N, c.rms_norm_eps);
         else
-            rmsnorm_f16<<<N, threads>>>(AS_CF16(m->buf_hidden), AS_CF16(norm_weight),
+            rmsnorm_f32in_f16w<<<N, threads>>>(m->buf_hidden, AS_CF16(norm_weight),
                 AS_F16(m->buf_norm), c.hidden_size, N, c.rms_norm_eps);
     }
 
@@ -475,17 +480,17 @@ static gollmgo_status_t run_layer(gollmgo_model_t m, int layer, int N,
     st = gemm(m, m->buf_ffn, w_down, m->buf_ffn_out, N, c.hidden_size, c.intermediate_size);
     if (st != GOLLMGO_OK) return st;
 
-    /* Residual add: hidden = hidden + ffn_out. */
+    /* Residual add: FP32 hidden += half-precision ffn_out. */
     {
         int total = N * c.hidden_size;
         int threads = 256;
         int blocks = (total + threads - 1) / threads;
         if (bf16)
-            residual_add_bf16<<<blocks, threads>>>(AS_CBF16(m->buf_hidden),
-                AS_CBF16(m->buf_ffn_out), AS_BF16(m->buf_hidden), total);
+            residual_add_f32_bf16<<<blocks, threads>>>(m->buf_hidden,
+                AS_CBF16(m->buf_ffn_out), total);
         else
-            residual_add_f16<<<blocks, threads>>>(AS_CF16(m->buf_hidden),
-                AS_CF16(m->buf_ffn_out), AS_F16(m->buf_hidden), total);
+            residual_add_f32_f16<<<blocks, threads>>>(m->buf_hidden,
+                AS_CF16(m->buf_ffn_out), total);
     }
 
     return GOLLMGO_OK;
@@ -497,14 +502,15 @@ static void run_embedding(gollmgo_model_t m, int32_t* d_token_ids, int N) {
     auto& c = m->config;
     int threads = (c.hidden_size < 256) ? c.hidden_size : 256;
     dim3 grid(N, (c.hidden_size + threads - 1) / threads);
+    /* Write directly to FP32 buf_hidden from half-precision embedding table. */
     if (IS_BF16(m))
-        embedding_lookup_bf16<<<grid, threads>>>(
+        embedding_bf16_to_f32<<<grid, threads>>>(
             AS_CBF16(get_weight(m, "model.embed_tokens.weight")),
-            d_token_ids, AS_BF16(m->buf_hidden), c.hidden_size, c.vocab_size);
+            d_token_ids, m->buf_hidden, c.hidden_size, c.vocab_size);
     else
-        embedding_lookup_f16<<<grid, threads>>>(
+        embedding_f16_to_f32<<<grid, threads>>>(
             AS_CF16(get_weight(m, "model.embed_tokens.weight")),
-            d_token_ids, AS_F16(m->buf_hidden), c.hidden_size, c.vocab_size);
+            d_token_ids, m->buf_hidden, c.hidden_size, c.vocab_size);
 }
 
 static gollmgo_status_t run_lm_head(gollmgo_model_t m, int N, float* host_logits_out) {
@@ -512,15 +518,15 @@ static gollmgo_status_t run_lm_head(gollmgo_model_t m, int N, float* host_logits
     bool bf16 = IS_BF16(m);
     gollmgo_status_t st;
 
-    /* Final RMSNorm. */
+    /* Final RMSNorm: FP32 hidden → half-precision for LM head GEMM. */
     {
         int threads = (c.hidden_size < 256) ? c.hidden_size : 256;
         if (bf16)
-            rmsnorm_bf16<<<N, threads>>>(AS_CBF16(m->buf_hidden),
+            rmsnorm_f32in_bf16w<<<N, threads>>>(m->buf_hidden,
                 AS_CBF16(get_weight(m, "model.norm.weight")),
                 AS_BF16(m->buf_norm), c.hidden_size, N, c.rms_norm_eps);
         else
-            rmsnorm_f16<<<N, threads>>>(AS_CF16(m->buf_hidden),
+            rmsnorm_f32in_f16w<<<N, threads>>>(m->buf_hidden,
                 AS_CF16(get_weight(m, "model.norm.weight")),
                 AS_F16(m->buf_norm), c.hidden_size, N, c.rms_norm_eps);
     }

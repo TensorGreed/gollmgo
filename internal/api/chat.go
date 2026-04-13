@@ -270,40 +270,56 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request, req *ChatC
 		}},
 	})
 
+	// sendFinish terminates the stream with a finish_reason and [DONE].
+	sendFinish := func(reason string) {
+		writeSSE(w, flusher, StreamChunk{
+			ID: engineReq.ID, Object: "chat.completion.chunk",
+			Created: time.Now().Unix(), Model: req.Model,
+			Choices: []StreamChunkChoice{{
+				Index:        0,
+				Delta:        StreamChunkDelta{},
+				FinishReason: &reason,
+			}},
+		})
+		fmt.Fprintf(w, "data: [DONE]\n\n")
+		flusher.Flush()
+	}
+
 	// Block on per-request channel for each token.
 	for {
 		select {
 		case <-r.Context().Done():
-			goto done
+			sendFinish("length")
+			return
 		case tok, ok := <-handle.Tokens:
 			if !ok {
-				// Channel closed — send an error chunk before [DONE].
-				writeSSE(w, flusher, StreamChunk{
-					ID: engineReq.ID, Object: "chat.completion.chunk",
-					Created: time.Now().Unix(), Model: req.Model,
-					Choices: []StreamChunkChoice{{
-						Index: 0,
-						Delta: StreamChunkDelta{Content: "\n[error: engine shut down]"},
-					}},
-				})
-				goto done
+				// Channel closed without Finished — engine shut down.
+				sendFinish("error")
+				return
 			}
 			if tok.Err != nil {
-				writeSSE(w, flusher, StreamChunk{
-					ID: engineReq.ID, Object: "chat.completion.chunk",
-					Created: time.Now().Unix(), Model: req.Model,
-					Choices: []StreamChunkChoice{{
-						Index: 0,
-						Delta: StreamChunkDelta{Content: "\n[error: " + tok.Err.Error() + "]"},
-					}},
-				})
-				goto done
+				// Backend error — terminate cleanly, not as content.
+				sendFinish("error")
+				return
 			}
 			content := s.detokenize([]int32{tok.TokenID})
-			var finishReason *string
 			if tok.Finished {
-				s := "stop"
-				finishReason = &s
+				// Final content token + finish_reason in same chunk.
+				stop := "stop"
+				writeSSE(w, flusher, StreamChunk{
+					ID:      engineReq.ID,
+					Object:  "chat.completion.chunk",
+					Created: time.Now().Unix(),
+					Model:   req.Model,
+					Choices: []StreamChunkChoice{{
+						Index:        0,
+						Delta:        StreamChunkDelta{Content: content},
+						FinishReason: &stop,
+					}},
+				})
+				fmt.Fprintf(w, "data: [DONE]\n\n")
+				flusher.Flush()
+				return
 			}
 			writeSSE(w, flusher, StreamChunk{
 				ID:      engineReq.ID,
@@ -311,20 +327,12 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request, req *ChatC
 				Created: time.Now().Unix(),
 				Model:   req.Model,
 				Choices: []StreamChunkChoice{{
-					Index:        0,
-					Delta:        StreamChunkDelta{Content: content},
-					FinishReason: finishReason,
+					Index: 0,
+					Delta: StreamChunkDelta{Content: content},
 				}},
 			})
-			if tok.Finished {
-				goto done
-			}
 		}
 	}
-
-done:
-	fmt.Fprintf(w, "data: [DONE]\n\n")
-	flusher.Flush()
 }
 
 // --- Helpers ---

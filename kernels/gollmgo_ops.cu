@@ -488,3 +488,142 @@ __global__ void bf16_to_f16(
     if (idx >= total_elements) return;
     out[idx] = __float2half(__bfloat162float(in[idx]));
 }
+
+/* ================================================================
+ * Mixed-precision kernels (FP32 hidden state)
+ *
+ * These keep the main hidden-state accumulator in FP32 to prevent
+ * rounding error from compounding across transformer layers.
+ * Weights stay in their native half-precision format.
+ * ================================================================ */
+
+/* ---- Embedding: half-precision table → FP32 output ---- */
+__global__ void embedding_f16_to_f32(
+    const __half* __restrict__ table,
+    const int32_t* __restrict__ ids,
+    float* __restrict__ out,
+    int hidden_size, int vocab_size)
+{
+    int token_idx = blockIdx.x;
+    int dim_idx = threadIdx.x + blockIdx.y * blockDim.x;
+    if (dim_idx >= hidden_size) return;
+    int32_t id = ids[token_idx];
+    if (id >= 0 && id < vocab_size) {
+        out[token_idx * hidden_size + dim_idx] =
+            __half2float(table[id * hidden_size + dim_idx]);
+    }
+}
+
+__global__ void embedding_bf16_to_f32(
+    const __nv_bfloat16* __restrict__ table,
+    const int32_t* __restrict__ ids,
+    float* __restrict__ out,
+    int hidden_size, int vocab_size)
+{
+    int token_idx = blockIdx.x;
+    int dim_idx = threadIdx.x + blockIdx.y * blockDim.x;
+    if (dim_idx >= hidden_size) return;
+    int32_t id = ids[token_idx];
+    if (id >= 0 && id < vocab_size) {
+        out[token_idx * hidden_size + dim_idx] =
+            __bfloat162float(table[id * hidden_size + dim_idx]);
+    }
+}
+
+/* ---- RMSNorm: FP32 input, half weight → half output ---- */
+__global__ void rmsnorm_f32in_f16w(
+    const float* __restrict__ x,
+    const __half* __restrict__ weight,
+    __half* __restrict__ out,
+    int hidden_size, int n, float eps)
+{
+    int row = blockIdx.x;
+    if (row >= n) return;
+    const float* x_row = x + row * hidden_size;
+    __half* out_row = out + row * hidden_size;
+
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        ss += x_row[i] * x_row[i];
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        ss += __shfl_down_sync(0xffffffff, ss, offset);
+
+    __shared__ float shared_ss[32];
+    int lane = threadIdx.x % warpSize;
+    int warp_id = threadIdx.x / warpSize;
+    if (lane == 0) shared_ss[warp_id] = ss;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float total = 0.0f;
+        int num_warps = (blockDim.x + warpSize - 1) / warpSize;
+        for (int i = 0; i < num_warps; i++) total += shared_ss[i];
+        shared_ss[0] = rsqrtf(total / (float)hidden_size + eps);
+    }
+    __syncthreads();
+    float rms_inv = shared_ss[0];
+
+    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        float val = x_row[i] * rms_inv * __half2float(weight[i]);
+        out_row[i] = __float2half(val);
+    }
+}
+
+__global__ void rmsnorm_f32in_bf16w(
+    const float* __restrict__ x,
+    const __nv_bfloat16* __restrict__ weight,
+    __nv_bfloat16* __restrict__ out,
+    int hidden_size, int n, float eps)
+{
+    int row = blockIdx.x;
+    if (row >= n) return;
+    const float* x_row = x + row * hidden_size;
+    __nv_bfloat16* out_row = out + row * hidden_size;
+
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        ss += x_row[i] * x_row[i];
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        ss += __shfl_down_sync(0xffffffff, ss, offset);
+
+    __shared__ float shared_ss[32];
+    int lane = threadIdx.x % warpSize;
+    int warp_id = threadIdx.x / warpSize;
+    if (lane == 0) shared_ss[warp_id] = ss;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float total = 0.0f;
+        int num_warps = (blockDim.x + warpSize - 1) / warpSize;
+        for (int i = 0; i < num_warps; i++) total += shared_ss[i];
+        shared_ss[0] = rsqrtf(total / (float)hidden_size + eps);
+    }
+    __syncthreads();
+    float rms_inv = shared_ss[0];
+
+    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        float val = x_row[i] * rms_inv * __bfloat162float(weight[i]);
+        out_row[i] = __float2bfloat16(val);
+    }
+}
+
+/* ---- Residual add: FP32 += half ---- */
+__global__ void residual_add_f32_f16(
+    float* __restrict__ acc,
+    const __half* __restrict__ b,
+    int total_elements)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_elements) return;
+    acc[idx] += __half2float(b[idx]);
+}
+
+__global__ void residual_add_f32_bf16(
+    float* __restrict__ acc,
+    const __nv_bfloat16* __restrict__ b,
+    int total_elements)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_elements) return;
+    acc[idx] += __bfloat162float(b[idx]);
+}

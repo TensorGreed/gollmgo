@@ -10,11 +10,16 @@ import (
 
 	"github.com/TensorGreed/gollmgo/internal/backend"
 	"github.com/TensorGreed/gollmgo/internal/backend/cuda"
+	"github.com/TensorGreed/gollmgo/internal/config"
 	"github.com/TensorGreed/gollmgo/internal/model"
 )
 
 // initGPURunner creates a CUDA runner with a loaded model.
-func initGPURunner(log *slog.Logger, modelPath, tokenizerPath string, deviceID int) (backend.Runner, model.Tokenizer, error) {
+// Returns the runner, tokenizer, and the computed number of KV cache blocks
+// (so cmdServe can create a matching Go-side block pool).
+func initGPURunner(log *slog.Logger, cfg config.Config, deviceID int) (backend.Runner, model.Tokenizer, int, error) {
+	modelPath := cfg.ModelPath
+	tokenizerPath := cfg.TokenizerPath
 	log.Info("initializing GPU runner", "model", modelPath, "device", deviceID)
 
 	dir := filepath.Dir(modelPath)
@@ -23,7 +28,7 @@ func initGPURunner(log *slog.Logger, modelPath, tokenizerPath string, deviceID i
 	configPath := filepath.Join(dir, "config.json")
 	hfCfg, err := model.LoadHFConfig(configPath)
 	if err != nil {
-		return nil, nil, fmt.Errorf("load config.json: %w", err)
+		return nil, nil, 0, fmt.Errorf("load config.json: %w", err)
 	}
 	meta := hfCfg.ToModelMeta()
 
@@ -40,7 +45,7 @@ func initGPURunner(log *slog.Logger, modelPath, tokenizerPath string, deviceID i
 	// --- Create CUDA runner ---
 	runner, err := cuda.New(deviceID)
 	if err != nil {
-		return nil, nil, fmt.Errorf("create CUDA runner: %w", err)
+		return nil, nil, 0, fmt.Errorf("create CUDA runner: %w", err)
 	}
 
 	info := runner.DeviceInfo()
@@ -55,7 +60,7 @@ func initGPURunner(log *slog.Logger, modelPath, tokenizerPath string, deviceID i
 	tensors, _, err := model.LoadSafetensorsWeights(modelPath)
 	if err != nil {
 		runner.Close()
-		return nil, nil, fmt.Errorf("load weights: %w", err)
+		return nil, nil, 0, fmt.Errorf("load weights: %w", err)
 	}
 	log.Info("weight tensors loaded", "count", len(tensors))
 
@@ -63,7 +68,7 @@ func initGPURunner(log *slog.Logger, modelPath, tokenizerPath string, deviceID i
 	cudaModel, err := cuda.LoadModel(runner, meta, hfCfg.IntermediateSize)
 	if err != nil {
 		runner.Close()
-		return nil, nil, fmt.Errorf("create CUDA model: %w", err)
+		return nil, nil, 0, fmt.Errorf("create CUDA model: %w", err)
 	}
 
 	// Upload weights directly — BF16 weights stay in BF16 (native kernel support).
@@ -71,7 +76,7 @@ func initGPURunner(log *slog.Logger, modelPath, tokenizerPath string, deviceID i
 		if err := cudaModel.LoadWeight(t.Name, t.Data, t.Dtype); err != nil {
 			cudaModel.Close()
 			runner.Close()
-			return nil, nil, fmt.Errorf("upload weight %q: %w", t.Name, err)
+			return nil, nil, 0, fmt.Errorf("upload weight %q: %w", t.Name, err)
 		}
 		if (i+1)%50 == 0 || i == len(tensors)-1 {
 			log.Info("weight upload progress", "loaded", i+1, "total", len(tensors))
@@ -81,7 +86,7 @@ func initGPURunner(log *slog.Logger, modelPath, tokenizerPath string, deviceID i
 	if err := cudaModel.Ready(); err != nil {
 		cudaModel.Close()
 		runner.Close()
-		return nil, nil, fmt.Errorf("model ready: %w", err)
+		return nil, nil, 0, fmt.Errorf("model ready: %w", err)
 	}
 	log.Info("model ready on GPU")
 
@@ -94,17 +99,48 @@ func initGPURunner(log *slog.Logger, modelPath, tokenizerPath string, deviceID i
 		log.Warn("warmup note", "error", err)
 	}
 
-	// --- Create GPU KV cache ---
-	blockSize := 16
-	numBlocks := 1024 // matches the Go-side pool in cmdServe
-	numSlots := numBlocks * blockSize
+	// --- Compute KV cache size from device memory ---
+	blockSize := cfg.BlockSize
 	headDim := meta.HiddenSize / meta.NumHeads
+	// Each KV block stores block_size tokens × num_kv_heads × head_dim × 2 bytes (FP16/BF16)
+	// for both K and V, across all layers.
+	bytesPerBlock := int64(blockSize) * int64(hfCfg.NumKeyValueHeads) * int64(headDim) * 2 * 2 * int64(meta.NumLayers)
+
+	// Compute model weight memory from uploaded tensors.
+	var weightBytes int64
+	for _, t := range tensors {
+		weightBytes += int64(len(t.Data))
+	}
+
+	// Budget: (device_free - weight_memory - scratch_headroom) * max_memory_fraction
+	// Subtract weights and a fixed headroom for model scratch buffers, CUDA context, etc.
+	scratchHeadroom := int64(512 * 1024 * 1024) // 512 MB for activations and CUDA overhead
+	memFraction := cfg.MaxMemoryFraction
+	freeAfterWeights := int64(info.FreeMemoryBytes) - weightBytes - scratchHeadroom
+	if freeAfterWeights < 0 {
+		freeAfterWeights = 0
+	}
+	availableBytes := int64(float64(freeAfterWeights) * memFraction)
+
+	numBlocks := int(availableBytes / bytesPerBlock)
+	if numBlocks < 64 {
+		numBlocks = 64 // minimum viable cache
+	}
+	numSlots := numBlocks * blockSize
+
+	log.Info("KV cache sizing",
+		"device_free_gb", fmt.Sprintf("%.1f", float64(info.FreeMemoryBytes)/(1<<30)),
+		"weight_gb", fmt.Sprintf("%.1f", float64(weightBytes)/(1<<30)),
+		"max_memory_fraction", memFraction,
+		"bytes_per_block", bytesPerBlock,
+		"num_blocks", numBlocks,
+		"num_slots", numSlots)
 
 	kvCache, err := cuda.NewCUDAKVCache(runner, meta.NumLayers, numSlots, hfCfg.NumKeyValueHeads, headDim)
 	if err != nil {
 		cudaModel.Close()
 		runner.Close()
-		return nil, nil, fmt.Errorf("create KV cache: %w", err)
+		return nil, nil, 0, fmt.Errorf("create KV cache: %w", err)
 	}
 	log.Info("GPU KV cache created", "slots", numSlots, "kv_heads", hfCfg.NumKeyValueHeads, "head_dim", headDim)
 
@@ -130,5 +166,5 @@ func initGPURunner(log *slog.Logger, modelPath, tokenizerPath string, deviceID i
 		log.Info("tokenizer loaded", "vocab", hfTok.VocabSize(), "eos", hfTok.EOSTokenID())
 	}
 
-	return fullRunner, tokenizer, nil
+	return fullRunner, tokenizer, numBlocks, nil
 }

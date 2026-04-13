@@ -248,9 +248,48 @@ func TestChatCompletionsChannelCloseStreaming(t *testing.T) {
 	s.Handler().ServeHTTP(rec, req)
 
 	respBody := rec.Body.String()
-	// Should contain an error indication before [DONE].
-	if !strings.Contains(respBody, "error") {
-		t.Fatal("expected error indication in streaming response on shutdown")
+	// Must have finish_reason "error" — not error text as content.
+	if !strings.Contains(respBody, `"finish_reason":"error"`) {
+		t.Fatalf("expected finish_reason error in streaming response, got:\n%s", respBody)
+	}
+	// Must NOT have error text embedded as assistant content.
+	if strings.Contains(respBody, "[error:") {
+		t.Fatal("error text should not appear as assistant content")
+	}
+	if !strings.Contains(respBody, "[DONE]") {
+		t.Fatal("expected [DONE] sentinel")
+	}
+}
+
+func TestChatCompletionsStreamingTokenError(t *testing.T) {
+	s, eng := newTestServer(t)
+
+	body := `{"model":"test","messages":[{"role":"user","content":"hello"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	go func() {
+		for len(eng.PendingRequestIDs()) == 0 {
+		}
+		ids := eng.PendingRequestIDs()
+		eng.PushResultsTo(ids[0], []engine.TokenResult{
+			{SequenceID: 1, TokenID: 65, Finished: false},
+			{SequenceID: 1, Finished: true, Err: fmt.Errorf("GPU OOM")},
+		})
+	}()
+
+	s.Handler().ServeHTTP(rec, req)
+
+	respBody := rec.Body.String()
+	// Must terminate with finish_reason "error", not embed OOM text as content.
+	if !strings.Contains(respBody, `"finish_reason":"error"`) {
+		t.Fatalf("expected finish_reason error, got:\n%s", respBody)
+	}
+	if strings.Contains(respBody, "GPU OOM") {
+		t.Fatal("backend error details should not leak to client as content")
+	}
+	if !strings.Contains(respBody, "[DONE]") {
+		t.Fatal("expected [DONE]")
 	}
 }
 

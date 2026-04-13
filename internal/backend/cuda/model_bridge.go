@@ -392,6 +392,31 @@ func (r *CUDARunnerWithModel) extractLastTokenLogits(allLogits []float32, seqTok
 	return out, nil
 }
 
+// Close releases the KV cache, model, and backend runner in reverse order.
+// Safe to call multiple times.
+func (r *CUDARunnerWithModel) Close() error {
+	var firstErr error
+	if r.KVCache != nil {
+		if err := r.KVCache.Close(); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("cuda: kvcache close: %w", err)
+		}
+		r.KVCache = nil
+	}
+	if r.Model != nil {
+		if err := r.Model.Close(); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("cuda: model close: %w", err)
+		}
+		r.Model = nil
+	}
+	if r.CUDARunner != nil {
+		if err := r.CUDARunner.Close(); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("cuda: runner close: %w", err)
+		}
+		r.CUDARunner = nil
+	}
+	return firstErr
+}
+
 // Ensure CUDARunnerWithModel satisfies the Runner interface.
 var _ backend.Runner = (*CUDARunnerWithModel)(nil)
 
