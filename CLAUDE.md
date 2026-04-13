@@ -1,7 +1,7 @@
 # gollmgo - Claude Code Project Memory
 
 ## Mission
-Build a production-grade inference engine that is at least vLLM-class on performance, easier to operate than Python-heavy stacks, and extensible to multi-node and multi-vendor GPUs.
+Build a production-grade inference engine with best-in-class throughput and latency, easier to operate than Python-heavy stacks, and extensible to multi-node and multi-vendor GPUs.
 
 ## Product Bar (Non-Negotiable)
 - Performance: competitive tokens/sec, TTFT, and ITL on real workloads.
@@ -59,7 +59,7 @@ make lint             # static checks
 - Every new scheduling/attention optimization needs correctness tests and benchmark deltas.
 
 ## Performance Targets (Single GPU Exit)
-- ShareGPT throughput: `>= 1.0x vLLM` on same hardware/config.
+- ShareGPT throughput: best-in-class on same hardware/config.
 - TTFT P50 (128-token prompt): `<= 15ms`.
 - ITL P50: `<= 10ms`.
 - Under sustained load: stable P99 latency without queue collapse.

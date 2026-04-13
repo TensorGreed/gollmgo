@@ -1,7 +1,7 @@
 # gollmgo - Codex Project Memory
 
 ## What Codex Should Assume
-- Product goal: become a world-class vLLM competitor.
+- Product goal: build a world-class LLM inference engine.
 - Hardware-first target: `NVIDIA DGX Spark (GB10 Grace Blackwell superchip)`.
 - Delivery order: single GPU -> multi-GPU -> cluster -> AMD.
 
@@ -9,7 +9,7 @@
 1. Single-GPU correctness and stability.
 2. Continuous batching + paged KV performance.
 3. OpenAI-compatible API and production controls.
-4. Benchmark parity with vLLM on pinned workloads.
+4. Best-in-class benchmark performance on pinned workloads.
 
 ## Engineering Guardrails
 - Keep scheduler tick path fast and non-blocking.

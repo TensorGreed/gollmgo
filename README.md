@@ -1,6 +1,6 @@
 # gollmgo
 
-A production-grade LLM inference engine written in Go with CUDA kernels. Targets vLLM-class performance with single-binary operational simplicity.
+A production-grade LLM inference engine written in Go with CUDA kernels. Built for high throughput, low latency, and single-binary operational simplicity.
 
 **Status:** Phase 1 — single-GPU foundation on NVIDIA DGX Spark (GB10 Grace Blackwell).
 
@@ -180,7 +180,7 @@ See [config.example.json](config.example.json) for all options. Key settings:
 | Phase | Goal | Status |
 |---|---|---|
 | 1 — Foundation | Single-GPU MVP with continuous batching | In progress |
-| 2 — Performance | vLLM parity: chunked prefill, CUDA graphs, FP8, speculative decode | Planned |
+| 2 — Performance | Chunked prefill, CUDA graphs, FP8, speculative decode | Planned |
 | 3 — Production | Graceful drain, rate limits, zero-downtime reload | Planned |
 | 4 — Multi-GPU | Tensor parallelism, multi-LoRA | Planned |
 | 5 — Cluster | Disaggregated prefill/decode, distributed KV | Planned |
