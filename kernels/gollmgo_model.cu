@@ -1,11 +1,10 @@
 /*
- * gollmgo_model.cu — Model loading and eager forward pass.
+ * gollmgo_model.cu — Model loading and forward pass with FP16/BF16 support.
  *
  * Uses cuBLAS for linear projections (GEMM) and custom kernels for
- * embedding, RMSNorm, RoPE, SiLU, and naive attention.
+ * embedding, RMSNorm, RoPE, SiLU, and attention.
  *
- * M5: correctness-first eager forward pass.
- * M6 replaces naive attention with paged attention + KV cache.
+ * Runtime dtype selection: GOLLMGO_DTYPE_FP16 or GOLLMGO_DTYPE_BF16.
  */
 
 #include "gollmgo_model.h"
@@ -13,6 +12,7 @@
 #include "gollmgo_paged_attn.cuh"
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <cstring>
 #include <cstdio>
@@ -37,20 +37,21 @@ struct gollmgo_model {
     /* Named weight tensors on device. */
     std::unordered_map<std::string, weight_tensor> weights;
 
-    /* Scratch buffers (allocated on model_ready). */
-    __half* buf_hidden;       /* [max_batch, hidden_size] */
-    __half* buf_norm;         /* [max_batch, hidden_size] */
-    __half* buf_q;            /* [max_batch, num_heads * head_dim] */
-    __half* buf_k;            /* [max_batch, num_kv_heads * head_dim] */
-    __half* buf_v;            /* [max_batch, num_kv_heads * head_dim] */
-    __half* buf_attn_out;     /* [max_batch, num_heads * head_dim] */
-    __half* buf_proj;         /* [max_batch, hidden_size] */
-    __half* buf_gate;         /* [max_batch, intermediate_size] */
-    __half* buf_up;           /* [max_batch, intermediate_size] */
-    __half* buf_ffn;          /* [max_batch, intermediate_size] */
-    __half* buf_ffn_out;      /* [max_batch, hidden_size] */
-    __half* buf_logits_f16;   /* [max_batch, vocab_size] */
-    float*  buf_logits_f32;   /* [max_batch, vocab_size] — device staging */
+    /* Scratch buffers — void* for dtype-agnostic allocation.
+     * Element size is 2 bytes for both FP16 and BF16. */
+    void* buf_hidden;       /* [max_batch, hidden_size] */
+    void* buf_norm;         /* [max_batch, hidden_size] */
+    void* buf_q;            /* [max_batch, num_heads * head_dim] */
+    void* buf_k;            /* [max_batch, num_kv_heads * head_dim] */
+    void* buf_v;            /* [max_batch, num_kv_heads * head_dim] */
+    void* buf_attn_out;     /* [max_batch, num_heads * head_dim] */
+    void* buf_proj;         /* [max_batch, hidden_size] */
+    void* buf_gate;         /* [max_batch, intermediate_size] */
+    void* buf_up;           /* [max_batch, intermediate_size] */
+    void* buf_ffn;          /* [max_batch, intermediate_size] */
+    void* buf_ffn_out;      /* [max_batch, hidden_size] */
+    void* buf_logits_half;  /* [max_batch, vocab_size] — FP16 or BF16 */
+    float*  buf_logits_f32; /* [max_batch, vocab_size] — device staging */
 
     int max_batch;
 };
@@ -66,40 +67,95 @@ static gollmgo_status_t model_check_cuda(gollmgo_model_t m, cudaError_t err) {
 }
 
 /* Helper: get weight pointer or null. */
-static __half* get_weight(gollmgo_model_t m, const std::string& name) {
+static void* get_weight(gollmgo_model_t m, const std::string& name) {
     auto it = m->weights.find(name);
     if (it == m->weights.end()) return nullptr;
-    return (__half*)it->second.data;
+    return it->second.data;
 }
 
-/* ---- cuBLAS GEMM helper ---- */
+/* ---- cuBLAS GEMM helpers ---- */
 /* C = A * B^T  (row-major A[M,K], B[N,K] -> C[M,N]) */
 /* cuBLAS is column-major, so we compute C^T = B * A^T. */
-static gollmgo_status_t gemm_f16(gollmgo_model_t m,
-                                  const __half* A, const __half* B, __half* C,
-                                  int M, int N, int K) {
-    __half alpha_h = __float2half(1.0f);
-    __half beta_h  = __float2half(0.0f);
 
-    /* Column-major: op(B)[K,N] * op(A)[K,M]^T -> C_col[N,M] = C_row[M,N] */
-    cublasStatus_t status = cublasHgemm(
+static gollmgo_status_t gemm_f16(gollmgo_model_t m,
+                                  const void* A, const void* B, void* C,
+                                  int M, int N, int K) {
+    float alpha = 1.0f;
+    float beta  = 0.0f;
+
+    /* Use GemmEx with FP32 accumulation for better precision.
+     * cublasHgemm accumulates in FP16 which causes significant error
+     * over 22 transformer layers. */
+    cublasStatus_t status = cublasGemmEx(
         m->cublas,
-        CUBLAS_OP_T,  /* B^T in col-major = B in row-major */
-        CUBLAS_OP_N,  /* A in col-major = A^T in row-major */
+        CUBLAS_OP_T, CUBLAS_OP_N,
         N, M, K,
-        &alpha_h,
-        B, K,         /* B: [N, K] row-major -> [K, N] col-major, ldb=K */
-        A, K,         /* A: [M, K] row-major -> [K, M] col-major, lda=K */
-        &beta_h,
-        C, N          /* C: [M, N] row-major -> [N, M] col-major, ldc=N */
+        &alpha,
+        B, CUDA_R_16F, K,
+        A, CUDA_R_16F, K,
+        &beta,
+        C, CUDA_R_16F, N,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT
     );
 
     if (status != CUBLAS_STATUS_SUCCESS) {
-        model_set_error(m, "cuBLAS HGEMM failed");
+        char msg[128];
+        snprintf(msg, sizeof(msg), "cuBLAS GemmEx FP16 failed (status %d)", (int)status);
+        model_set_error(m, msg);
         return GOLLMGO_ERR_INTERNAL;
     }
     return GOLLMGO_OK;
 }
+
+static gollmgo_status_t gemm_bf16(gollmgo_model_t m,
+                                   const void* A, const void* B, void* C,
+                                   int M, int N, int K) {
+    float alpha = 1.0f;
+    float beta  = 0.0f;
+
+    cublasStatus_t status = cublasGemmEx(
+        m->cublas,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        N, M, K,
+        &alpha,
+        B, CUDA_R_16BF, K,
+        A, CUDA_R_16BF, K,
+        &beta,
+        C, CUDA_R_16BF, N,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT
+    );
+
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "cuBLAS GemmEx BF16 failed (status %d)", (int)status);
+        model_set_error(m, msg);
+        return GOLLMGO_ERR_INTERNAL;
+    }
+    return GOLLMGO_OK;
+}
+
+/* Dispatch GEMM based on model dtype. */
+static gollmgo_status_t gemm(gollmgo_model_t m,
+                              const void* A, const void* B, void* C,
+                              int M, int N, int K) {
+    if (m->config.dtype == GOLLMGO_DTYPE_BF16)
+        return gemm_bf16(m, A, B, C, M, N, K);
+    return gemm_f16(m, A, B, C, M, N, K);
+}
+
+/* ---- Kernel dispatch macros ----
+ * These dispatch to FP16 or BF16 kernels based on model dtype.
+ * All buffers are void* — we cast at the call site.
+ */
+
+#define AS_F16(p) ((__half*)(p))
+#define AS_BF16(p) ((__nv_bfloat16*)(p))
+#define AS_CF16(p) ((const __half*)(p))
+#define AS_CBF16(p) ((const __nv_bfloat16*)(p))
+
+#define IS_BF16(m) ((m)->config.dtype == GOLLMGO_DTYPE_BF16)
 
 /* ---- C API implementation ---- */
 
@@ -137,7 +193,7 @@ gollmgo_status_t gollmgo_model_create(gollmgo_backend_t b,
     m->buf_up = nullptr;
     m->buf_ffn = nullptr;
     m->buf_ffn_out = nullptr;
-    m->buf_logits_f16 = nullptr;
+    m->buf_logits_half = nullptr;
     m->buf_logits_f32 = nullptr;
 
     cublasStatus_t cstat = cublasCreate(&m->cublas);
@@ -198,7 +254,7 @@ gollmgo_status_t gollmgo_model_ready(gollmgo_model_t m) {
         return GOLLMGO_ERR_INVALID;
     }
 
-    /* Allocate scratch buffers for max_seq_len tokens. */
+    /* Allocate scratch buffers — 2 bytes per element for both FP16 and BF16. */
     int max_n = m->config.max_seq_len;
     if (max_n <= 0) max_n = 2048;
     m->max_batch = max_n;
@@ -207,22 +263,22 @@ gollmgo_status_t gollmgo_model_ready(gollmgo_model_t m) {
     gollmgo_status_t st;
 
     #define ALLOC_BUF(ptr, count) do { \
-        st = model_check_cuda(m, cudaMalloc((void**)&(ptr), (count) * sizeof(__half))); \
+        st = model_check_cuda(m, cudaMalloc(&(ptr), (count) * 2)); \
         if (st != GOLLMGO_OK) return st; \
     } while(0)
 
-    ALLOC_BUF(m->buf_hidden,     max_n * c.hidden_size);
-    ALLOC_BUF(m->buf_norm,       max_n * c.hidden_size);
-    ALLOC_BUF(m->buf_q,          max_n * c.num_heads * c.head_dim);
-    ALLOC_BUF(m->buf_k,          max_n * c.num_kv_heads * c.head_dim);
-    ALLOC_BUF(m->buf_v,          max_n * c.num_kv_heads * c.head_dim);
-    ALLOC_BUF(m->buf_attn_out,   max_n * c.num_heads * c.head_dim);
-    ALLOC_BUF(m->buf_proj,       max_n * c.hidden_size);
-    ALLOC_BUF(m->buf_gate,       max_n * c.intermediate_size);
-    ALLOC_BUF(m->buf_up,         max_n * c.intermediate_size);
-    ALLOC_BUF(m->buf_ffn,        max_n * c.intermediate_size);
-    ALLOC_BUF(m->buf_ffn_out,    max_n * c.hidden_size);
-    ALLOC_BUF(m->buf_logits_f16, max_n * c.vocab_size);
+    ALLOC_BUF(m->buf_hidden,      max_n * c.hidden_size);
+    ALLOC_BUF(m->buf_norm,        max_n * c.hidden_size);
+    ALLOC_BUF(m->buf_q,           max_n * c.num_heads * c.head_dim);
+    ALLOC_BUF(m->buf_k,           max_n * c.num_kv_heads * c.head_dim);
+    ALLOC_BUF(m->buf_v,           max_n * c.num_kv_heads * c.head_dim);
+    ALLOC_BUF(m->buf_attn_out,    max_n * c.num_heads * c.head_dim);
+    ALLOC_BUF(m->buf_proj,        max_n * c.hidden_size);
+    ALLOC_BUF(m->buf_gate,        max_n * c.intermediate_size);
+    ALLOC_BUF(m->buf_up,          max_n * c.intermediate_size);
+    ALLOC_BUF(m->buf_ffn,         max_n * c.intermediate_size);
+    ALLOC_BUF(m->buf_ffn_out,     max_n * c.hidden_size);
+    ALLOC_BUF(m->buf_logits_half, max_n * c.vocab_size);
     st = model_check_cuda(m, cudaMalloc((void**)&m->buf_logits_f32,
                                          max_n * c.vocab_size * sizeof(float)));
     if (st != GOLLMGO_OK) return st;
@@ -232,6 +288,269 @@ gollmgo_status_t gollmgo_model_ready(gollmgo_model_t m) {
     m->ready = true;
     return GOLLMGO_OK;
 }
+
+/* ---- Helper: run one transformer layer ---- */
+static gollmgo_status_t run_layer(gollmgo_model_t m, int layer, int N,
+                                   int32_t* d_positions, int32_t* d_slot_mapping,
+                                   gollmgo_kvcache_t kv_cache,
+                                   /* paged decode params (NULL for prefill/eager) */
+                                   int32_t* d_seq_lens, int32_t* d_slot_tables,
+                                   int max_context_len, bool paged_decode) {
+    auto& c = m->config;
+    gollmgo_status_t st;
+    char name_buf[256];
+    bool bf16 = IS_BF16(m);
+
+    /* -- Attention block -- */
+
+    /* RMSNorm (input_layernorm). */
+    snprintf(name_buf, sizeof(name_buf), "model.layers.%d.input_layernorm.weight", layer);
+    void* norm_weight = get_weight(m, name_buf);
+    if (!norm_weight) { model_set_error(m, name_buf); return GOLLMGO_ERR_INVALID; }
+
+    {
+        int threads = (c.hidden_size < 256) ? c.hidden_size : 256;
+        if (bf16)
+            rmsnorm_bf16<<<N, threads>>>(AS_CBF16(m->buf_hidden), AS_CBF16(norm_weight),
+                AS_BF16(m->buf_norm), c.hidden_size, N, c.rms_norm_eps);
+        else
+            rmsnorm_f16<<<N, threads>>>(AS_CF16(m->buf_hidden), AS_CF16(norm_weight),
+                AS_F16(m->buf_norm), c.hidden_size, N, c.rms_norm_eps);
+    }
+
+    /* Q, K, V projections. */
+    snprintf(name_buf, sizeof(name_buf), "model.layers.%d.self_attn.q_proj.weight", layer);
+    void* wq = get_weight(m, name_buf);
+    snprintf(name_buf, sizeof(name_buf), "model.layers.%d.self_attn.k_proj.weight", layer);
+    void* wk = get_weight(m, name_buf);
+    snprintf(name_buf, sizeof(name_buf), "model.layers.%d.self_attn.v_proj.weight", layer);
+    void* wv = get_weight(m, name_buf);
+    if (!wq || !wk || !wv) { model_set_error(m, "missing QKV weights"); return GOLLMGO_ERR_INVALID; }
+
+    st = gemm(m, m->buf_norm, wq, m->buf_q, N, c.num_heads * c.head_dim, c.hidden_size);
+    if (st != GOLLMGO_OK) return st;
+    st = gemm(m, m->buf_norm, wk, m->buf_k, N, c.num_kv_heads * c.head_dim, c.hidden_size);
+    if (st != GOLLMGO_OK) return st;
+    st = gemm(m, m->buf_norm, wv, m->buf_v, N, c.num_kv_heads * c.head_dim, c.hidden_size);
+    if (st != GOLLMGO_OK) return st;
+
+    /* RoPE. */
+    {
+        int max_heads = (c.num_heads > c.num_kv_heads) ? c.num_heads : c.num_kv_heads;
+        dim3 grid(N, max_heads);
+        int threads = c.head_dim / 2;
+        if (bf16)
+            rope_bf16<<<grid, threads>>>(AS_BF16(m->buf_q), AS_BF16(m->buf_k),
+                d_positions, N, c.num_heads, c.num_kv_heads, c.head_dim, 10000.0f);
+        else
+            rope_f16<<<grid, threads>>>(AS_F16(m->buf_q), AS_F16(m->buf_k),
+                d_positions, N, c.num_heads, c.num_kv_heads, c.head_dim, 10000.0f);
+    }
+
+    /* KV cache write (if available). */
+    if (kv_cache && d_slot_mapping) {
+        void* lk = gollmgo_kvcache_k_layer_ptr(kv_cache, layer);
+        void* lv = gollmgo_kvcache_v_layer_ptr(kv_cache, layer);
+        if (lk && lv) {
+            int kv_size = c.num_kv_heads * c.head_dim;
+            int threads = (kv_size < 256) ? kv_size : 256;
+            if (bf16)
+                paged_kv_write_bf16<<<N, threads>>>(AS_BF16(lk), AS_BF16(lv),
+                    AS_CBF16(m->buf_k), AS_CBF16(m->buf_v), d_slot_mapping,
+                    N, c.num_kv_heads, c.head_dim);
+            else
+                paged_kv_write_f16<<<N, threads>>>(AS_F16(lk), AS_F16(lv),
+                    AS_CF16(m->buf_k), AS_CF16(m->buf_v), d_slot_mapping,
+                    N, c.num_kv_heads, c.head_dim);
+        }
+    }
+
+    /* Attention. */
+    if (paged_decode && kv_cache) {
+        /* Paged attention for decode. */
+        void* lk = gollmgo_kvcache_k_layer_ptr(kv_cache, layer);
+        void* lv = gollmgo_kvcache_v_layer_ptr(kv_cache, layer);
+        dim3 grid(N, c.num_heads);
+        int threads = (c.head_dim < 32) ? c.head_dim : 32;
+        int smem = max_context_len * sizeof(float);
+        if (bf16)
+            paged_attention_v1_bf16<<<grid, threads, smem>>>(
+                AS_CBF16(m->buf_q), AS_CBF16(lk), AS_CBF16(lv), AS_BF16(m->buf_attn_out),
+                d_seq_lens, d_slot_tables,
+                N, c.num_heads, c.num_kv_heads, c.head_dim,
+                max_context_len, 1.0f / sqrtf((float)c.head_dim));
+        else
+            paged_attention_v1_f16<<<grid, threads, smem>>>(
+                AS_CF16(m->buf_q), AS_CF16(lk), AS_CF16(lv), AS_F16(m->buf_attn_out),
+                d_seq_lens, d_slot_tables,
+                N, c.num_heads, c.num_kv_heads, c.head_dim,
+                max_context_len, 1.0f / sqrtf((float)c.head_dim));
+    } else {
+        /* Naive (eager) attention. */
+        dim3 grid(N, c.num_heads);
+        int threads = (c.head_dim < 32) ? c.head_dim : 32;
+        int smem = N * sizeof(float);
+        if (bf16)
+            naive_attention_bf16<<<grid, threads, smem>>>(
+                AS_CBF16(m->buf_q), AS_CBF16(m->buf_k), AS_CBF16(m->buf_v),
+                AS_BF16(m->buf_attn_out), d_positions,
+                N, c.num_heads, c.num_kv_heads, c.head_dim,
+                1.0f / sqrtf((float)c.head_dim));
+        else
+            naive_attention_f16<<<grid, threads, smem>>>(
+                AS_CF16(m->buf_q), AS_CF16(m->buf_k), AS_CF16(m->buf_v),
+                AS_F16(m->buf_attn_out), d_positions,
+                N, c.num_heads, c.num_kv_heads, c.head_dim,
+                1.0f / sqrtf((float)c.head_dim));
+    }
+
+    /* Output projection. */
+    snprintf(name_buf, sizeof(name_buf), "model.layers.%d.self_attn.o_proj.weight", layer);
+    void* wo = get_weight(m, name_buf);
+    if (!wo) { model_set_error(m, "missing o_proj weight"); return GOLLMGO_ERR_INVALID; }
+
+    st = gemm(m, m->buf_attn_out, wo, m->buf_proj, N, c.hidden_size, c.num_heads * c.head_dim);
+    if (st != GOLLMGO_OK) return st;
+
+    /* Residual add: hidden = hidden + proj. */
+    {
+        int total = N * c.hidden_size;
+        int threads = 256;
+        int blocks = (total + threads - 1) / threads;
+        if (bf16)
+            residual_add_bf16<<<blocks, threads>>>(AS_CBF16(m->buf_hidden),
+                AS_CBF16(m->buf_proj), AS_BF16(m->buf_hidden), total);
+        else
+            residual_add_f16<<<blocks, threads>>>(AS_CF16(m->buf_hidden),
+                AS_CF16(m->buf_proj), AS_F16(m->buf_hidden), total);
+    }
+
+    /* -- FFN block -- */
+
+    /* RMSNorm (post_attention_layernorm). */
+    snprintf(name_buf, sizeof(name_buf), "model.layers.%d.post_attention_layernorm.weight", layer);
+    norm_weight = get_weight(m, name_buf);
+    if (!norm_weight) { model_set_error(m, name_buf); return GOLLMGO_ERR_INVALID; }
+
+    {
+        int threads = (c.hidden_size < 256) ? c.hidden_size : 256;
+        if (bf16)
+            rmsnorm_bf16<<<N, threads>>>(AS_CBF16(m->buf_hidden), AS_CBF16(norm_weight),
+                AS_BF16(m->buf_norm), c.hidden_size, N, c.rms_norm_eps);
+        else
+            rmsnorm_f16<<<N, threads>>>(AS_CF16(m->buf_hidden), AS_CF16(norm_weight),
+                AS_F16(m->buf_norm), c.hidden_size, N, c.rms_norm_eps);
+    }
+
+    /* Gate and up projections. */
+    snprintf(name_buf, sizeof(name_buf), "model.layers.%d.mlp.gate_proj.weight", layer);
+    void* w_gate = get_weight(m, name_buf);
+    snprintf(name_buf, sizeof(name_buf), "model.layers.%d.mlp.up_proj.weight", layer);
+    void* w_up = get_weight(m, name_buf);
+    if (!w_gate || !w_up) { model_set_error(m, "missing gate/up weights"); return GOLLMGO_ERR_INVALID; }
+
+    st = gemm(m, m->buf_norm, w_gate, m->buf_gate, N, c.intermediate_size, c.hidden_size);
+    if (st != GOLLMGO_OK) return st;
+    st = gemm(m, m->buf_norm, w_up, m->buf_up, N, c.intermediate_size, c.hidden_size);
+    if (st != GOLLMGO_OK) return st;
+
+    /* SiLU(gate) * up. */
+    {
+        int total = N * c.intermediate_size;
+        int threads = 256;
+        int blocks = (total + threads - 1) / threads;
+        if (bf16)
+            silu_mul_bf16<<<blocks, threads>>>(AS_CBF16(m->buf_gate), AS_CBF16(m->buf_up),
+                AS_BF16(m->buf_ffn), total);
+        else
+            silu_mul_f16<<<blocks, threads>>>(AS_CF16(m->buf_gate), AS_CF16(m->buf_up),
+                AS_F16(m->buf_ffn), total);
+    }
+
+    /* Down projection. */
+    snprintf(name_buf, sizeof(name_buf), "model.layers.%d.mlp.down_proj.weight", layer);
+    void* w_down = get_weight(m, name_buf);
+    if (!w_down) { model_set_error(m, "missing down_proj weight"); return GOLLMGO_ERR_INVALID; }
+
+    st = gemm(m, m->buf_ffn, w_down, m->buf_ffn_out, N, c.hidden_size, c.intermediate_size);
+    if (st != GOLLMGO_OK) return st;
+
+    /* Residual add: hidden = hidden + ffn_out. */
+    {
+        int total = N * c.hidden_size;
+        int threads = 256;
+        int blocks = (total + threads - 1) / threads;
+        if (bf16)
+            residual_add_bf16<<<blocks, threads>>>(AS_CBF16(m->buf_hidden),
+                AS_CBF16(m->buf_ffn_out), AS_BF16(m->buf_hidden), total);
+        else
+            residual_add_f16<<<blocks, threads>>>(AS_CF16(m->buf_hidden),
+                AS_CF16(m->buf_ffn_out), AS_F16(m->buf_hidden), total);
+    }
+
+    return GOLLMGO_OK;
+}
+
+/* ---- Helper: embedding + final norm + LM head ---- */
+
+static void run_embedding(gollmgo_model_t m, int32_t* d_token_ids, int N) {
+    auto& c = m->config;
+    int threads = (c.hidden_size < 256) ? c.hidden_size : 256;
+    dim3 grid(N, (c.hidden_size + threads - 1) / threads);
+    if (IS_BF16(m))
+        embedding_lookup_bf16<<<grid, threads>>>(
+            AS_CBF16(get_weight(m, "model.embed_tokens.weight")),
+            d_token_ids, AS_BF16(m->buf_hidden), c.hidden_size, c.vocab_size);
+    else
+        embedding_lookup_f16<<<grid, threads>>>(
+            AS_CF16(get_weight(m, "model.embed_tokens.weight")),
+            d_token_ids, AS_F16(m->buf_hidden), c.hidden_size, c.vocab_size);
+}
+
+static gollmgo_status_t run_lm_head(gollmgo_model_t m, int N, float* host_logits_out) {
+    auto& c = m->config;
+    bool bf16 = IS_BF16(m);
+    gollmgo_status_t st;
+
+    /* Final RMSNorm. */
+    {
+        int threads = (c.hidden_size < 256) ? c.hidden_size : 256;
+        if (bf16)
+            rmsnorm_bf16<<<N, threads>>>(AS_CBF16(m->buf_hidden),
+                AS_CBF16(get_weight(m, "model.norm.weight")),
+                AS_BF16(m->buf_norm), c.hidden_size, N, c.rms_norm_eps);
+        else
+            rmsnorm_f16<<<N, threads>>>(AS_CF16(m->buf_hidden),
+                AS_CF16(get_weight(m, "model.norm.weight")),
+                AS_F16(m->buf_norm), c.hidden_size, N, c.rms_norm_eps);
+    }
+
+    /* LM head GEMM. */
+    st = gemm(m, m->buf_norm, get_weight(m, "lm_head.weight"), m->buf_logits_half,
+              N, c.vocab_size, c.hidden_size);
+    if (st != GOLLMGO_OK) return st;
+
+    /* Convert to F32. */
+    {
+        int total = N * c.vocab_size;
+        int threads = 256;
+        int blocks = (total + threads - 1) / threads;
+        if (bf16)
+            bf16_to_f32<<<blocks, threads>>>(AS_CBF16(m->buf_logits_half),
+                m->buf_logits_f32, total);
+        else
+            f16_to_f32<<<blocks, threads>>>(AS_CF16(m->buf_logits_half),
+                m->buf_logits_f32, total);
+    }
+
+    st = model_check_cuda(m, cudaMemcpy(
+        host_logits_out, m->buf_logits_f32,
+        N * c.vocab_size * sizeof(float),
+        cudaMemcpyDeviceToHost));
+    return st;
+}
+
+/* ---- Forward pass implementations ---- */
 
 gollmgo_status_t gollmgo_model_forward(gollmgo_backend_t b,
                                         gollmgo_model_t m,
@@ -245,10 +564,8 @@ gollmgo_status_t gollmgo_model_forward(gollmgo_backend_t b,
         return GOLLMGO_ERR_INVALID;
     }
 
-    auto& c = m->config;
     gollmgo_status_t st;
 
-    /* Copy input tokens and positions to device. */
     int32_t* d_token_ids = nullptr;
     int32_t* d_positions = nullptr;
     st = model_check_cuda(m, cudaMalloc((void**)&d_token_ids, n_tokens * sizeof(int32_t)));
@@ -259,214 +576,21 @@ gollmgo_status_t gollmgo_model_forward(gollmgo_backend_t b,
     cudaMemcpy(d_token_ids, host_token_ids, n_tokens * sizeof(int32_t), cudaMemcpyHostToDevice);
     cudaMemcpy(d_positions, host_positions, n_tokens * sizeof(int32_t), cudaMemcpyHostToDevice);
 
-    /* ---- Embedding ---- */
-    {
-        int threads = (c.hidden_size < 256) ? c.hidden_size : 256;
-        dim3 grid(n_tokens, (c.hidden_size + threads - 1) / threads);
-        embedding_lookup_f16<<<grid, threads>>>(
-            get_weight(m, "model.embed_tokens.weight"),
-            d_token_ids,
-            m->buf_hidden,
-            c.hidden_size,
-            c.vocab_size);
+    run_embedding(m, d_token_ids, n_tokens);
+
+    for (int layer = 0; layer < m->config.num_layers; layer++) {
+        st = run_layer(m, layer, n_tokens, d_positions,
+                       nullptr, nullptr, nullptr, nullptr, 0, false);
+        if (st != GOLLMGO_OK) { cudaFree(d_token_ids); cudaFree(d_positions); return st; }
     }
 
-    /* ---- Transformer layers ---- */
-    for (int layer = 0; layer < c.num_layers; layer++) {
-        char name_buf[256];
-
-        /* -- Attention block -- */
-
-        /* RMSNorm (input_layernorm). */
-        snprintf(name_buf, sizeof(name_buf), "model.layers.%d.input_layernorm.weight", layer);
-        __half* norm_weight = get_weight(m, name_buf);
-        if (!norm_weight) {
-            model_set_error(m, name_buf);
-            cudaFree(d_token_ids); cudaFree(d_positions);
-            return GOLLMGO_ERR_INVALID;
-        }
-
-        {
-            int threads = (c.hidden_size < 256) ? c.hidden_size : 256;
-            rmsnorm_f16<<<n_tokens, threads>>>(
-                m->buf_hidden, norm_weight, m->buf_norm,
-                c.hidden_size, n_tokens, c.rms_norm_eps);
-        }
-
-        /* Q, K, V projections via cuBLAS. */
-        snprintf(name_buf, sizeof(name_buf), "model.layers.%d.self_attn.q_proj.weight", layer);
-        __half* wq = get_weight(m, name_buf);
-        snprintf(name_buf, sizeof(name_buf), "model.layers.%d.self_attn.k_proj.weight", layer);
-        __half* wk = get_weight(m, name_buf);
-        snprintf(name_buf, sizeof(name_buf), "model.layers.%d.self_attn.v_proj.weight", layer);
-        __half* wv = get_weight(m, name_buf);
-
-        if (!wq || !wk || !wv) {
-            model_set_error(m, "missing QKV weights");
-            cudaFree(d_token_ids); cudaFree(d_positions);
-            return GOLLMGO_ERR_INVALID;
-        }
-
-        /* buf_norm[n, H] * wq[num_heads*head_dim, H]^T -> buf_q[n, num_heads*head_dim] */
-        st = gemm_f16(m, m->buf_norm, wq, m->buf_q,
-                       n_tokens, c.num_heads * c.head_dim, c.hidden_size);
-        if (st != GOLLMGO_OK) { cudaFree(d_token_ids); cudaFree(d_positions); return st; }
-
-        st = gemm_f16(m, m->buf_norm, wk, m->buf_k,
-                       n_tokens, c.num_kv_heads * c.head_dim, c.hidden_size);
-        if (st != GOLLMGO_OK) { cudaFree(d_token_ids); cudaFree(d_positions); return st; }
-
-        st = gemm_f16(m, m->buf_norm, wv, m->buf_v,
-                       n_tokens, c.num_kv_heads * c.head_dim, c.hidden_size);
-        if (st != GOLLMGO_OK) { cudaFree(d_token_ids); cudaFree(d_positions); return st; }
-
-        /* RoPE. */
-        {
-            int max_heads = (c.num_heads > c.num_kv_heads) ? c.num_heads : c.num_kv_heads;
-            dim3 grid(n_tokens, max_heads);
-            int threads = c.head_dim / 2;
-            rope_f16<<<grid, threads>>>(
-                m->buf_q, m->buf_k, d_positions,
-                n_tokens, c.num_heads, c.num_kv_heads, c.head_dim,
-                10000.0f);
-        }
-
-        /* Naive attention. */
-        {
-            dim3 grid(n_tokens, c.num_heads);
-            int threads = (c.head_dim < 32) ? c.head_dim : 32;
-            int smem = n_tokens * sizeof(float);
-            naive_attention_f16<<<grid, threads, smem>>>(
-                m->buf_q, m->buf_k, m->buf_v, m->buf_attn_out,
-                d_positions,
-                n_tokens, c.num_heads, c.num_kv_heads, c.head_dim,
-                1.0f / sqrtf((float)c.head_dim));
-        }
-
-        /* Output projection: attn_out[n, num_heads*head_dim] * wo -> proj[n, hidden_size]. */
-        snprintf(name_buf, sizeof(name_buf), "model.layers.%d.self_attn.o_proj.weight", layer);
-        __half* wo = get_weight(m, name_buf);
-        if (!wo) {
-            model_set_error(m, "missing o_proj weight");
-            cudaFree(d_token_ids); cudaFree(d_positions);
-            return GOLLMGO_ERR_INVALID;
-        }
-
-        st = gemm_f16(m, m->buf_attn_out, wo, m->buf_proj,
-                       n_tokens, c.hidden_size, c.num_heads * c.head_dim);
-        if (st != GOLLMGO_OK) { cudaFree(d_token_ids); cudaFree(d_positions); return st; }
-
-        /* Residual add: hidden = hidden + proj. */
-        {
-            int total = n_tokens * c.hidden_size;
-            int threads = 256;
-            int blocks = (total + threads - 1) / threads;
-            residual_add_f16<<<blocks, threads>>>(
-                m->buf_hidden, m->buf_proj, m->buf_hidden, total);
-        }
-
-        /* -- FFN block -- */
-
-        /* RMSNorm (post_attention_layernorm). */
-        snprintf(name_buf, sizeof(name_buf), "model.layers.%d.post_attention_layernorm.weight", layer);
-        norm_weight = get_weight(m, name_buf);
-        if (!norm_weight) {
-            model_set_error(m, name_buf);
-            cudaFree(d_token_ids); cudaFree(d_positions);
-            return GOLLMGO_ERR_INVALID;
-        }
-
-        {
-            int threads = (c.hidden_size < 256) ? c.hidden_size : 256;
-            rmsnorm_f16<<<n_tokens, threads>>>(
-                m->buf_hidden, norm_weight, m->buf_norm,
-                c.hidden_size, n_tokens, c.rms_norm_eps);
-        }
-
-        /* Gate and up projections. */
-        snprintf(name_buf, sizeof(name_buf), "model.layers.%d.mlp.gate_proj.weight", layer);
-        __half* w_gate = get_weight(m, name_buf);
-        snprintf(name_buf, sizeof(name_buf), "model.layers.%d.mlp.up_proj.weight", layer);
-        __half* w_up = get_weight(m, name_buf);
-
-        if (!w_gate || !w_up) {
-            model_set_error(m, "missing gate/up weights");
-            cudaFree(d_token_ids); cudaFree(d_positions);
-            return GOLLMGO_ERR_INVALID;
-        }
-
-        st = gemm_f16(m, m->buf_norm, w_gate, m->buf_gate,
-                       n_tokens, c.intermediate_size, c.hidden_size);
-        if (st != GOLLMGO_OK) { cudaFree(d_token_ids); cudaFree(d_positions); return st; }
-
-        st = gemm_f16(m, m->buf_norm, w_up, m->buf_up,
-                       n_tokens, c.intermediate_size, c.hidden_size);
-        if (st != GOLLMGO_OK) { cudaFree(d_token_ids); cudaFree(d_positions); return st; }
-
-        /* SiLU(gate) * up. */
-        {
-            int total = n_tokens * c.intermediate_size;
-            int threads = 256;
-            int blocks = (total + threads - 1) / threads;
-            silu_mul_f16<<<blocks, threads>>>(
-                m->buf_gate, m->buf_up, m->buf_ffn, total);
-        }
-
-        /* Down projection. */
-        snprintf(name_buf, sizeof(name_buf), "model.layers.%d.mlp.down_proj.weight", layer);
-        __half* w_down = get_weight(m, name_buf);
-        if (!w_down) {
-            model_set_error(m, "missing down_proj weight");
-            cudaFree(d_token_ids); cudaFree(d_positions);
-            return GOLLMGO_ERR_INVALID;
-        }
-
-        st = gemm_f16(m, m->buf_ffn, w_down, m->buf_ffn_out,
-                       n_tokens, c.hidden_size, c.intermediate_size);
-        if (st != GOLLMGO_OK) { cudaFree(d_token_ids); cudaFree(d_positions); return st; }
-
-        /* Residual add: hidden = hidden + ffn_out. */
-        {
-            int total = n_tokens * c.hidden_size;
-            int threads = 256;
-            int blocks = (total + threads - 1) / threads;
-            residual_add_f16<<<blocks, threads>>>(
-                m->buf_hidden, m->buf_ffn_out, m->buf_hidden, total);
-        }
-    }
-
-    /* ---- Final RMSNorm ---- */
-    {
-        int threads = (c.hidden_size < 256) ? c.hidden_size : 256;
-        rmsnorm_f16<<<n_tokens, threads>>>(
-            m->buf_hidden, get_weight(m, "model.norm.weight"), m->buf_norm,
-            c.hidden_size, n_tokens, c.rms_norm_eps);
-    }
-
-    /* ---- LM head: norm[n, hidden] * lm_head[vocab, hidden]^T -> logits[n, vocab] ---- */
-    st = gemm_f16(m, m->buf_norm, get_weight(m, "lm_head.weight"), m->buf_logits_f16,
-                   n_tokens, c.vocab_size, c.hidden_size);
-    if (st != GOLLMGO_OK) { cudaFree(d_token_ids); cudaFree(d_positions); return st; }
-
-    /* Convert F16 logits to F32 on device, then copy to host. */
-    {
-        int total = n_tokens * c.vocab_size;
-        int threads = 256;
-        int blocks = (total + threads - 1) / threads;
-        f16_to_f32<<<blocks, threads>>>(m->buf_logits_f16, m->buf_logits_f32, total);
-    }
-
-    st = model_check_cuda(m, cudaMemcpy(
-        host_logits_out, m->buf_logits_f32,
-        n_tokens * c.vocab_size * sizeof(float),
-        cudaMemcpyDeviceToHost));
+    st = run_lm_head(m, n_tokens, host_logits_out);
 
     cudaFree(d_token_ids);
     cudaFree(d_positions);
     return st;
 }
 
-/* Prefill forward: eager attention + KV cache write for each layer. */
 gollmgo_status_t gollmgo_model_forward_prefill(
     gollmgo_backend_t b,
     gollmgo_model_t m,
@@ -483,7 +607,6 @@ gollmgo_status_t gollmgo_model_forward_prefill(
         return GOLLMGO_ERR_INVALID;
     }
 
-    auto& c = m->config;
     gollmgo_status_t st;
 
     int32_t* d_token_ids = nullptr;
@@ -504,157 +627,15 @@ gollmgo_status_t gollmgo_model_forward_prefill(
         cudaMemcpy(d_slot_mapping, host_slot_mapping, n_tokens * sizeof(int32_t), cudaMemcpyHostToDevice);
     }
 
-    /* Embedding. */
-    {
-        int threads = (c.hidden_size < 256) ? c.hidden_size : 256;
-        dim3 grid(n_tokens, (c.hidden_size + threads - 1) / threads);
-        embedding_lookup_f16<<<grid, threads>>>(
-            get_weight(m, "model.embed_tokens.weight"),
-            d_token_ids, m->buf_hidden, c.hidden_size, c.vocab_size);
+    run_embedding(m, d_token_ids, n_tokens);
+
+    for (int layer = 0; layer < m->config.num_layers; layer++) {
+        st = run_layer(m, layer, n_tokens, d_positions,
+                       d_slot_mapping, kv_cache, nullptr, nullptr, 0, false);
+        if (st != GOLLMGO_OK) goto prefill_cleanup;
     }
 
-    for (int layer = 0; layer < c.num_layers; layer++) {
-        char name_buf[256];
-
-        /* RMSNorm. */
-        snprintf(name_buf, sizeof(name_buf), "model.layers.%d.input_layernorm.weight", layer);
-        __half* norm_weight = get_weight(m, name_buf);
-        if (!norm_weight) { model_set_error(m, name_buf); st = GOLLMGO_ERR_INVALID; goto prefill_cleanup; }
-
-        {
-            int threads = (c.hidden_size < 256) ? c.hidden_size : 256;
-            rmsnorm_f16<<<n_tokens, threads>>>(
-                m->buf_hidden, norm_weight, m->buf_norm,
-                c.hidden_size, n_tokens, c.rms_norm_eps);
-        }
-
-        /* QKV projections. */
-        snprintf(name_buf, sizeof(name_buf), "model.layers.%d.self_attn.q_proj.weight", layer);
-        __half* wq = get_weight(m, name_buf);
-        snprintf(name_buf, sizeof(name_buf), "model.layers.%d.self_attn.k_proj.weight", layer);
-        __half* wk = get_weight(m, name_buf);
-        snprintf(name_buf, sizeof(name_buf), "model.layers.%d.self_attn.v_proj.weight", layer);
-        __half* wv = get_weight(m, name_buf);
-        if (!wq || !wk || !wv) { model_set_error(m, "missing QKV"); st = GOLLMGO_ERR_INVALID; goto prefill_cleanup; }
-
-        st = gemm_f16(m, m->buf_norm, wq, m->buf_q, n_tokens, c.num_heads * c.head_dim, c.hidden_size);
-        if (st != GOLLMGO_OK) goto prefill_cleanup;
-        st = gemm_f16(m, m->buf_norm, wk, m->buf_k, n_tokens, c.num_kv_heads * c.head_dim, c.hidden_size);
-        if (st != GOLLMGO_OK) goto prefill_cleanup;
-        st = gemm_f16(m, m->buf_norm, wv, m->buf_v, n_tokens, c.num_kv_heads * c.head_dim, c.hidden_size);
-        if (st != GOLLMGO_OK) goto prefill_cleanup;
-
-        /* RoPE. */
-        {
-            int max_heads = (c.num_heads > c.num_kv_heads) ? c.num_heads : c.num_kv_heads;
-            dim3 grid(n_tokens, max_heads);
-            rope_f16<<<grid, c.head_dim / 2>>>(
-                m->buf_q, m->buf_k, d_positions,
-                n_tokens, c.num_heads, c.num_kv_heads, c.head_dim, 10000.0f);
-        }
-
-        /* Write K/V to paged cache for this layer. */
-        if (kv_cache && d_slot_mapping) {
-            __half* lk = (__half*)gollmgo_kvcache_k_layer_ptr(kv_cache, layer);
-            __half* lv = (__half*)gollmgo_kvcache_v_layer_ptr(kv_cache, layer);
-            if (lk && lv) {
-                int kv_size = c.num_kv_heads * c.head_dim;
-                int threads = (kv_size < 256) ? kv_size : 256;
-                paged_kv_write_f16<<<n_tokens, threads>>>(
-                    lk, lv, m->buf_k, m->buf_v, d_slot_mapping,
-                    n_tokens, c.num_kv_heads, c.head_dim);
-            }
-        }
-
-        /* Naive (full) attention — correct for prefill. */
-        {
-            dim3 grid(n_tokens, c.num_heads);
-            int threads = (c.head_dim < 32) ? c.head_dim : 32;
-            int smem = n_tokens * sizeof(float);
-            naive_attention_f16<<<grid, threads, smem>>>(
-                m->buf_q, m->buf_k, m->buf_v, m->buf_attn_out,
-                d_positions, n_tokens, c.num_heads, c.num_kv_heads, c.head_dim,
-                1.0f / sqrtf((float)c.head_dim));
-        }
-
-        /* O projection + residual. */
-        snprintf(name_buf, sizeof(name_buf), "model.layers.%d.self_attn.o_proj.weight", layer);
-        __half* wo = get_weight(m, name_buf);
-        if (!wo) { model_set_error(m, "missing o_proj"); st = GOLLMGO_ERR_INVALID; goto prefill_cleanup; }
-
-        st = gemm_f16(m, m->buf_attn_out, wo, m->buf_proj,
-                       n_tokens, c.hidden_size, c.num_heads * c.head_dim);
-        if (st != GOLLMGO_OK) goto prefill_cleanup;
-
-        {
-            int total = n_tokens * c.hidden_size;
-            residual_add_f16<<<(total + 255) / 256, 256>>>(
-                m->buf_hidden, m->buf_proj, m->buf_hidden, total);
-        }
-
-        /* FFN. */
-        snprintf(name_buf, sizeof(name_buf), "model.layers.%d.post_attention_layernorm.weight", layer);
-        norm_weight = get_weight(m, name_buf);
-        if (!norm_weight) { model_set_error(m, name_buf); st = GOLLMGO_ERR_INVALID; goto prefill_cleanup; }
-
-        {
-            int threads = (c.hidden_size < 256) ? c.hidden_size : 256;
-            rmsnorm_f16<<<n_tokens, threads>>>(
-                m->buf_hidden, norm_weight, m->buf_norm,
-                c.hidden_size, n_tokens, c.rms_norm_eps);
-        }
-
-        snprintf(name_buf, sizeof(name_buf), "model.layers.%d.mlp.gate_proj.weight", layer);
-        __half* w_gate = get_weight(m, name_buf);
-        snprintf(name_buf, sizeof(name_buf), "model.layers.%d.mlp.up_proj.weight", layer);
-        __half* w_up = get_weight(m, name_buf);
-        if (!w_gate || !w_up) { model_set_error(m, "missing gate/up"); st = GOLLMGO_ERR_INVALID; goto prefill_cleanup; }
-
-        st = gemm_f16(m, m->buf_norm, w_gate, m->buf_gate, n_tokens, c.intermediate_size, c.hidden_size);
-        if (st != GOLLMGO_OK) goto prefill_cleanup;
-        st = gemm_f16(m, m->buf_norm, w_up, m->buf_up, n_tokens, c.intermediate_size, c.hidden_size);
-        if (st != GOLLMGO_OK) goto prefill_cleanup;
-
-        {
-            int total = n_tokens * c.intermediate_size;
-            silu_mul_f16<<<(total + 255) / 256, 256>>>(m->buf_gate, m->buf_up, m->buf_ffn, total);
-        }
-
-        snprintf(name_buf, sizeof(name_buf), "model.layers.%d.mlp.down_proj.weight", layer);
-        __half* w_down = get_weight(m, name_buf);
-        if (!w_down) { model_set_error(m, "missing down_proj"); st = GOLLMGO_ERR_INVALID; goto prefill_cleanup; }
-
-        st = gemm_f16(m, m->buf_ffn, w_down, m->buf_ffn_out, n_tokens, c.hidden_size, c.intermediate_size);
-        if (st != GOLLMGO_OK) goto prefill_cleanup;
-
-        {
-            int total = n_tokens * c.hidden_size;
-            residual_add_f16<<<(total + 255) / 256, 256>>>(
-                m->buf_hidden, m->buf_ffn_out, m->buf_hidden, total);
-        }
-    }
-
-    /* Final RMSNorm + LM head. */
-    {
-        int threads = (c.hidden_size < 256) ? c.hidden_size : 256;
-        rmsnorm_f16<<<n_tokens, threads>>>(
-            m->buf_hidden, get_weight(m, "model.norm.weight"), m->buf_norm,
-            c.hidden_size, n_tokens, c.rms_norm_eps);
-    }
-
-    st = gemm_f16(m, m->buf_norm, get_weight(m, "lm_head.weight"), m->buf_logits_f16,
-                   n_tokens, c.vocab_size, c.hidden_size);
-    if (st != GOLLMGO_OK) goto prefill_cleanup;
-
-    {
-        int total = n_tokens * c.vocab_size;
-        f16_to_f32<<<(total + 255) / 256, 256>>>(m->buf_logits_f16, m->buf_logits_f32, total);
-    }
-
-    st = model_check_cuda(m, cudaMemcpy(
-        host_logits_out, m->buf_logits_f32,
-        n_tokens * c.vocab_size * sizeof(float),
-        cudaMemcpyDeviceToHost));
+    st = run_lm_head(m, n_tokens, host_logits_out);
 
 prefill_cleanup:
     cudaFree(d_token_ids);
@@ -663,21 +644,6 @@ prefill_cleanup:
     return st;
 }
 
-/*
- * Decode-only forward pass with paged KV cache.
- *
- * Constraint: n_tokens == n_seqs (exactly 1 token per sequence).
- * This is the common decode case. No scattering/gathering needed.
- *
- * Per layer:
- *   1. RMSNorm + QKV projection + RoPE on all n_tokens
- *   2. Write new K/V to cache slots
- *   3. Paged attention: each query reads its full context from cache
- *   4. O projection + residual
- *   5. FFN + residual
- *
- * Output: [n_seqs * vocab_size] logits
- */
 gollmgo_status_t gollmgo_model_forward_paged(
     gollmgo_backend_t b,
     gollmgo_model_t m,
@@ -698,15 +664,13 @@ gollmgo_status_t gollmgo_model_forward_paged(
         model_set_error(m, "n_tokens out of range");
         return GOLLMGO_ERR_INVALID;
     }
-    /* Decode-only: one token per sequence. */
     if (n_tokens != n_seqs) {
         model_set_error(m, "paged forward requires n_tokens == n_seqs (decode only)");
         return GOLLMGO_ERR_INVALID;
     }
 
-    auto& c = m->config;
+    int N = n_tokens;
     gollmgo_status_t st;
-    int N = n_tokens; /* == n_seqs */
 
     int32_t *d_token_ids = nullptr, *d_positions = nullptr, *d_slot_mapping = nullptr;
     int32_t *d_seq_lens = nullptr, *d_slot_tables = nullptr;
@@ -728,158 +692,16 @@ gollmgo_status_t gollmgo_model_forward_paged(
     cudaMemcpy(d_seq_lens, host_seq_lens, N * sizeof(int32_t), cudaMemcpyHostToDevice);
     cudaMemcpy(d_slot_tables, host_slot_tables, (size_t)N * max_context_len * sizeof(int32_t), cudaMemcpyHostToDevice);
 
-    /* ---- Embedding ---- */
-    {
-        int threads = (c.hidden_size < 256) ? c.hidden_size : 256;
-        dim3 grid(N, (c.hidden_size + threads - 1) / threads);
-        embedding_lookup_f16<<<grid, threads>>>(
-            get_weight(m, "model.embed_tokens.weight"),
-            d_token_ids, m->buf_hidden, c.hidden_size, c.vocab_size);
+    run_embedding(m, d_token_ids, N);
+
+    for (int layer = 0; layer < m->config.num_layers; layer++) {
+        st = run_layer(m, layer, N, d_positions,
+                       d_slot_mapping, kv_cache,
+                       d_seq_lens, d_slot_tables, max_context_len, true);
+        if (st != GOLLMGO_OK) goto cleanup;
     }
 
-    /* ---- Transformer layers ---- */
-    for (int layer = 0; layer < c.num_layers; layer++) {
-        char name_buf[256];
-
-        /* RMSNorm. */
-        snprintf(name_buf, sizeof(name_buf), "model.layers.%d.input_layernorm.weight", layer);
-        __half* norm_weight = get_weight(m, name_buf);
-        if (!norm_weight) { model_set_error(m, name_buf); st = GOLLMGO_ERR_INVALID; goto cleanup; }
-
-        {
-            int threads = (c.hidden_size < 256) ? c.hidden_size : 256;
-            rmsnorm_f16<<<N, threads>>>(
-                m->buf_hidden, norm_weight, m->buf_norm,
-                c.hidden_size, N, c.rms_norm_eps);
-        }
-
-        /* QKV projections. */
-        snprintf(name_buf, sizeof(name_buf), "model.layers.%d.self_attn.q_proj.weight", layer);
-        __half* wq = get_weight(m, name_buf);
-        snprintf(name_buf, sizeof(name_buf), "model.layers.%d.self_attn.k_proj.weight", layer);
-        __half* wk = get_weight(m, name_buf);
-        snprintf(name_buf, sizeof(name_buf), "model.layers.%d.self_attn.v_proj.weight", layer);
-        __half* wv = get_weight(m, name_buf);
-        if (!wq || !wk || !wv) { model_set_error(m, "missing QKV"); st = GOLLMGO_ERR_INVALID; goto cleanup; }
-
-        st = gemm_f16(m, m->buf_norm, wq, m->buf_q, N, c.num_heads * c.head_dim, c.hidden_size);
-        if (st != GOLLMGO_OK) goto cleanup;
-        st = gemm_f16(m, m->buf_norm, wk, m->buf_k, N, c.num_kv_heads * c.head_dim, c.hidden_size);
-        if (st != GOLLMGO_OK) goto cleanup;
-        st = gemm_f16(m, m->buf_norm, wv, m->buf_v, N, c.num_kv_heads * c.head_dim, c.hidden_size);
-        if (st != GOLLMGO_OK) goto cleanup;
-
-        /* RoPE. */
-        {
-            int max_heads = (c.num_heads > c.num_kv_heads) ? c.num_heads : c.num_kv_heads;
-            dim3 grid(N, max_heads);
-            rope_f16<<<grid, c.head_dim / 2>>>(
-                m->buf_q, m->buf_k, d_positions,
-                N, c.num_heads, c.num_kv_heads, c.head_dim, 10000.0f);
-        }
-
-        /* Write K/V to paged cache for this layer. */
-        __half* layer_k = (__half*)gollmgo_kvcache_k_layer_ptr(kv_cache, layer);
-        __half* layer_v = (__half*)gollmgo_kvcache_v_layer_ptr(kv_cache, layer);
-        {
-            int kv_size = c.num_kv_heads * c.head_dim;
-            int threads = (kv_size < 256) ? kv_size : 256;
-            paged_kv_write_f16<<<N, threads>>>(
-                layer_k, layer_v, m->buf_k, m->buf_v, d_slot_mapping,
-                N, c.num_kv_heads, c.head_dim);
-        }
-
-        /* Paged attention: each of N queries attends over its full context. */
-        {
-            dim3 grid(N, c.num_heads);
-            int threads = (c.head_dim < 32) ? c.head_dim : 32;
-            int smem = max_context_len * sizeof(float);
-            paged_attention_v1_f16<<<grid, threads, smem>>>(
-                m->buf_q, layer_k, layer_v, m->buf_attn_out,
-                d_seq_lens, d_slot_tables,
-                N, c.num_heads, c.num_kv_heads, c.head_dim,
-                max_context_len, 1.0f / sqrtf((float)c.head_dim));
-        }
-
-        /* O projection. */
-        snprintf(name_buf, sizeof(name_buf), "model.layers.%d.self_attn.o_proj.weight", layer);
-        __half* wo = get_weight(m, name_buf);
-        if (!wo) { model_set_error(m, "missing o_proj"); st = GOLLMGO_ERR_INVALID; goto cleanup; }
-
-        st = gemm_f16(m, m->buf_attn_out, wo, m->buf_proj,
-                       N, c.hidden_size, c.num_heads * c.head_dim);
-        if (st != GOLLMGO_OK) goto cleanup;
-
-        /* Residual add. */
-        {
-            int total = N * c.hidden_size;
-            residual_add_f16<<<(total + 255) / 256, 256>>>(
-                m->buf_hidden, m->buf_proj, m->buf_hidden, total);
-        }
-
-        /* FFN. */
-        snprintf(name_buf, sizeof(name_buf), "model.layers.%d.post_attention_layernorm.weight", layer);
-        norm_weight = get_weight(m, name_buf);
-        if (!norm_weight) { model_set_error(m, name_buf); st = GOLLMGO_ERR_INVALID; goto cleanup; }
-
-        {
-            int threads = (c.hidden_size < 256) ? c.hidden_size : 256;
-            rmsnorm_f16<<<N, threads>>>(
-                m->buf_hidden, norm_weight, m->buf_norm,
-                c.hidden_size, N, c.rms_norm_eps);
-        }
-
-        snprintf(name_buf, sizeof(name_buf), "model.layers.%d.mlp.gate_proj.weight", layer);
-        __half* w_gate = get_weight(m, name_buf);
-        snprintf(name_buf, sizeof(name_buf), "model.layers.%d.mlp.up_proj.weight", layer);
-        __half* w_up = get_weight(m, name_buf);
-        if (!w_gate || !w_up) { model_set_error(m, "missing gate/up"); st = GOLLMGO_ERR_INVALID; goto cleanup; }
-
-        st = gemm_f16(m, m->buf_norm, w_gate, m->buf_gate, N, c.intermediate_size, c.hidden_size);
-        if (st != GOLLMGO_OK) goto cleanup;
-        st = gemm_f16(m, m->buf_norm, w_up, m->buf_up, N, c.intermediate_size, c.hidden_size);
-        if (st != GOLLMGO_OK) goto cleanup;
-
-        {
-            int total = N * c.intermediate_size;
-            silu_mul_f16<<<(total + 255) / 256, 256>>>(m->buf_gate, m->buf_up, m->buf_ffn, total);
-        }
-
-        snprintf(name_buf, sizeof(name_buf), "model.layers.%d.mlp.down_proj.weight", layer);
-        __half* w_down = get_weight(m, name_buf);
-        if (!w_down) { model_set_error(m, "missing down_proj"); st = GOLLMGO_ERR_INVALID; goto cleanup; }
-
-        st = gemm_f16(m, m->buf_ffn, w_down, m->buf_ffn_out, N, c.hidden_size, c.intermediate_size);
-        if (st != GOLLMGO_OK) goto cleanup;
-
-        {
-            int total = N * c.hidden_size;
-            residual_add_f16<<<(total + 255) / 256, 256>>>(
-                m->buf_hidden, m->buf_ffn_out, m->buf_hidden, total);
-        }
-    }
-
-    /* ---- Final RMSNorm + LM head ---- */
-    {
-        int threads = (c.hidden_size < 256) ? c.hidden_size : 256;
-        rmsnorm_f16<<<N, threads>>>(
-            m->buf_hidden, get_weight(m, "model.norm.weight"), m->buf_norm,
-            c.hidden_size, N, c.rms_norm_eps);
-    }
-
-    st = gemm_f16(m, m->buf_norm, get_weight(m, "lm_head.weight"), m->buf_logits_f16,
-                   N, c.vocab_size, c.hidden_size);
-    if (st != GOLLMGO_OK) goto cleanup;
-
-    {
-        int total = N * c.vocab_size;
-        f16_to_f32<<<(total + 255) / 256, 256>>>(m->buf_logits_f16, m->buf_logits_f32, total);
-    }
-
-    st = model_check_cuda(m, cudaMemcpy(
-        host_logits_out, m->buf_logits_f32,
-        N * c.vocab_size * sizeof(float),
-        cudaMemcpyDeviceToHost));
+    st = run_lm_head(m, N, host_logits_out);
 
 cleanup:
     cudaFree(d_token_ids);
@@ -893,12 +715,10 @@ cleanup:
 gollmgo_status_t gollmgo_model_destroy(gollmgo_model_t m) {
     if (!m) return GOLLMGO_OK;
 
-    /* Free all weight tensors. */
     for (auto& kv : m->weights) {
         cudaFree(kv.second.data);
     }
 
-    /* Free scratch buffers. */
     cudaFree(m->buf_hidden);
     cudaFree(m->buf_norm);
     cudaFree(m->buf_q);
@@ -910,7 +730,7 @@ gollmgo_status_t gollmgo_model_destroy(gollmgo_model_t m) {
     cudaFree(m->buf_up);
     cudaFree(m->buf_ffn);
     cudaFree(m->buf_ffn_out);
-    cudaFree(m->buf_logits_f16);
+    cudaFree(m->buf_logits_half);
     cudaFree(m->buf_logits_f32);
 
     if (m->cublas) {

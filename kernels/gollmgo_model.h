@@ -18,6 +18,10 @@ extern "C" {
 /* Opaque model handle. */
 typedef struct gollmgo_model* gollmgo_model_t;
 
+/* Compute dtype constants. */
+#define GOLLMGO_DTYPE_FP16  0
+#define GOLLMGO_DTYPE_BF16  1
+
 /* Model architecture config. */
 typedef struct {
     int num_layers;
@@ -29,6 +33,7 @@ typedef struct {
     int max_seq_len;
     int head_dim;          /* hidden_size / num_heads */
     float rms_norm_eps;
+    int dtype;             /* GOLLMGO_DTYPE_FP16 or GOLLMGO_DTYPE_BF16 */
 } gollmgo_model_config_t;
 
 /* Create a model with the given config. Allocates GPU memory for weights. */

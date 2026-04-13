@@ -13,9 +13,9 @@ struct gollmgo_kvcache {
     int num_slots;
     int num_kv_heads;
     int head_dim;
-    size_t layer_size;    /* num_slots * num_kv_heads * head_dim (in __half elements) */
-    __half* k_cache;      /* [num_layers, num_slots, num_kv_heads, head_dim] */
-    __half* v_cache;      /* [num_layers, num_slots, num_kv_heads, head_dim] */
+    size_t layer_size;    /* num_slots * num_kv_heads * head_dim (in 2-byte elements) */
+    void* k_cache;        /* [num_layers, num_slots, num_kv_heads, head_dim] FP16 or BF16 */
+    void* v_cache;        /* [num_layers, num_slots, num_kv_heads, head_dim] FP16 or BF16 */
 };
 
 extern "C" {
@@ -36,7 +36,8 @@ gollmgo_status_t gollmgo_kvcache_create(gollmgo_backend_t b,
     c->head_dim = head_dim;
     c->layer_size = (size_t)num_slots * num_kv_heads * head_dim;
 
-    size_t total_size = (size_t)num_layers * c->layer_size * sizeof(__half);
+    /* 2 bytes per element for both FP16 and BF16. */
+    size_t total_size = (size_t)num_layers * c->layer_size * 2;
 
     cudaError_t err = cudaMalloc(&c->k_cache, total_size);
     if (err != cudaSuccess) { delete c; return GOLLMGO_ERR_OOM; }
@@ -53,12 +54,12 @@ gollmgo_status_t gollmgo_kvcache_create(gollmgo_backend_t b,
 
 void* gollmgo_kvcache_k_layer_ptr(gollmgo_kvcache_t cache, int layer) {
     if (!cache || layer < 0 || layer >= cache->num_layers) return nullptr;
-    return (void*)(cache->k_cache + layer * cache->layer_size);
+    return (void*)((char*)cache->k_cache + layer * cache->layer_size * 2);
 }
 
 void* gollmgo_kvcache_v_layer_ptr(gollmgo_kvcache_t cache, int layer) {
     if (!cache || layer < 0 || layer >= cache->num_layers) return nullptr;
-    return (void*)(cache->v_cache + layer * cache->layer_size);
+    return (void*)((char*)cache->v_cache + layer * cache->layer_size * 2);
 }
 
 gollmgo_status_t gollmgo_kvcache_write(gollmgo_kvcache_t cache,
@@ -86,7 +87,7 @@ gollmgo_status_t gollmgo_kvcache_write(gollmgo_kvcache_t cache,
 
     int threads = (kv_size < 256) ? kv_size : 256;
     paged_kv_write_f16<<<n_tokens, threads>>>(
-        cache->k_cache, cache->v_cache,
+        (__half*)cache->k_cache, (__half*)cache->v_cache,
         d_k, d_v, d_slots,
         n_tokens, cache->num_kv_heads, cache->head_dim);
 
@@ -139,7 +140,7 @@ gollmgo_status_t gollmgo_kvcache_attention(gollmgo_kvcache_t cache,
     size_t smem = max_seq_len * sizeof(float);
 
     paged_attention_v1_f16<<<grid, threads, smem>>>(
-        d_q, cache->k_cache, cache->v_cache, d_out,
+        d_q, (const __half*)cache->k_cache, (const __half*)cache->v_cache, d_out,
         d_seq_lens, d_slot_tables,
         n_queries, num_heads, num_kv_heads, head_dim,
         max_seq_len, scale);

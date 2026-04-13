@@ -66,15 +66,9 @@ func initGPURunner(log *slog.Logger, modelPath, tokenizerPath string, deviceID i
 		return nil, nil, fmt.Errorf("create CUDA model: %w", err)
 	}
 
-	// Upload weights — convert BF16 to FP16 since kernels use __half.
+	// Upload weights directly — BF16 weights stay in BF16 (native kernel support).
 	for i, t := range tensors {
-		data := t.Data
-		dtype := t.Dtype
-		if dtype == "BF16" {
-			data = model.ConvertBF16ToFP16(data)
-			dtype = "F16"
-		}
-		if err := cudaModel.LoadWeight(t.Name, data, dtype); err != nil {
+		if err := cudaModel.LoadWeight(t.Name, t.Data, t.Dtype); err != nil {
 			cudaModel.Close()
 			runner.Close()
 			return nil, nil, fmt.Errorf("upload weight %q: %w", t.Name, err)

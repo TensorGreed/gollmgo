@@ -7,33 +7,33 @@
 #define GOLLMGO_OPS_CUH
 
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+/* ======== FP16 kernels ======== */
+
 /* ---- Embedding lookup ---- */
-/* out[i] = table[ids[i]] for i in [0, n) */
 __global__ void embedding_lookup_f16(
-    const __half* __restrict__ table,   /* [vocab_size, hidden_size] */
-    const int32_t* __restrict__ ids,    /* [n] */
-    __half* __restrict__ out,           /* [n, hidden_size] */
+    const __half* __restrict__ table,
+    const int32_t* __restrict__ ids,
+    __half* __restrict__ out,
     int hidden_size,
     int vocab_size);
 
 /* ---- RMS Norm ---- */
-/* out = (x / rms(x)) * weight, rms(x) = sqrt(mean(x^2) + eps) */
 __global__ void rmsnorm_f16(
-    const __half* __restrict__ x,       /* [n, hidden_size] */
-    const __half* __restrict__ weight,  /* [hidden_size] */
-    __half* __restrict__ out,           /* [n, hidden_size] */
+    const __half* __restrict__ x,
+    const __half* __restrict__ weight,
+    __half* __restrict__ out,
     int hidden_size,
     int n,
     float eps);
 
-/* ---- RoPE (Rotary Position Embedding) ---- */
-/* Apply RoPE in-place to q and k. */
+/* ---- RoPE ---- */
 __global__ void rope_f16(
-    __half* __restrict__ q,             /* [n, num_heads, head_dim] */
-    __half* __restrict__ k,             /* [n, num_kv_heads, head_dim] */
-    const int32_t* __restrict__ positions, /* [n] */
+    __half* __restrict__ q,
+    __half* __restrict__ k,
+    const int32_t* __restrict__ positions,
     int n,
     int num_heads,
     int num_kv_heads,
@@ -41,24 +41,19 @@ __global__ void rope_f16(
     float theta_base);
 
 /* ---- SiLU activation ---- */
-/* out = silu(gate) * up = (gate * sigmoid(gate)) * up */
 __global__ void silu_mul_f16(
-    const __half* __restrict__ gate,    /* [n, intermediate_size] */
-    const __half* __restrict__ up,      /* [n, intermediate_size] */
-    __half* __restrict__ out,           /* [n, intermediate_size] */
+    const __half* __restrict__ gate,
+    const __half* __restrict__ up,
+    __half* __restrict__ out,
     int total_elements);
 
-/* ---- Naive multi-head attention (no paging) ---- */
-/*
- * Full QKV attention with causal mask. No KV cache — recomputes everything.
- * This is correct but slow; M6 replaces this with paged attention.
- */
+/* ---- Naive attention ---- */
 __global__ void naive_attention_f16(
-    const __half* __restrict__ q,       /* [n, num_heads, head_dim] */
-    const __half* __restrict__ k,       /* [n, num_kv_heads, head_dim] */
-    const __half* __restrict__ v,       /* [n, num_kv_heads, head_dim] */
-    __half* __restrict__ out,           /* [n, num_heads, head_dim] */
-    const int32_t* __restrict__ positions, /* [n] */
+    const __half* __restrict__ q,
+    const __half* __restrict__ k,
+    const __half* __restrict__ v,
+    __half* __restrict__ out,
+    const int32_t* __restrict__ positions,
     int n,
     int num_heads,
     int num_kv_heads,
@@ -66,17 +61,83 @@ __global__ void naive_attention_f16(
     float scale);
 
 /* ---- Residual add ---- */
-/* out = a + b, element-wise */
 __global__ void residual_add_f16(
     const __half* __restrict__ a,
     const __half* __restrict__ b,
     __half* __restrict__ out,
     int total_elements);
 
-/* ---- F16 to F32 copy (for logits output) ---- */
+/* ---- F16 to F32 ---- */
 __global__ void f16_to_f32(
     const __half* __restrict__ in,
     float* __restrict__ out,
+    int total_elements);
+
+/* ======== BF16 kernels ======== */
+
+__global__ void embedding_lookup_bf16(
+    const __nv_bfloat16* __restrict__ table,
+    const int32_t* __restrict__ ids,
+    __nv_bfloat16* __restrict__ out,
+    int hidden_size,
+    int vocab_size);
+
+__global__ void rmsnorm_bf16(
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ weight,
+    __nv_bfloat16* __restrict__ out,
+    int hidden_size,
+    int n,
+    float eps);
+
+__global__ void rope_bf16(
+    __nv_bfloat16* __restrict__ q,
+    __nv_bfloat16* __restrict__ k,
+    const int32_t* __restrict__ positions,
+    int n,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    float theta_base);
+
+__global__ void silu_mul_bf16(
+    const __nv_bfloat16* __restrict__ gate,
+    const __nv_bfloat16* __restrict__ up,
+    __nv_bfloat16* __restrict__ out,
+    int total_elements);
+
+__global__ void naive_attention_bf16(
+    const __nv_bfloat16* __restrict__ q,
+    const __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ v,
+    __nv_bfloat16* __restrict__ out,
+    const int32_t* __restrict__ positions,
+    int n,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    float scale);
+
+__global__ void residual_add_bf16(
+    const __nv_bfloat16* __restrict__ a,
+    const __nv_bfloat16* __restrict__ b,
+    __nv_bfloat16* __restrict__ out,
+    int total_elements);
+
+__global__ void bf16_to_f32(
+    const __nv_bfloat16* __restrict__ in,
+    float* __restrict__ out,
+    int total_elements);
+
+/* ---- Cross-dtype conversions ---- */
+__global__ void f16_to_bf16(
+    const __half* __restrict__ in,
+    __nv_bfloat16* __restrict__ out,
+    int total_elements);
+
+__global__ void bf16_to_f16(
+    const __nv_bfloat16* __restrict__ in,
+    __half* __restrict__ out,
     int total_elements);
 
 #endif /* GOLLMGO_OPS_CUH */

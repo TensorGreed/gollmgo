@@ -26,6 +26,11 @@ type CUDAModel struct {
 
 // LoadModel creates a CUDA model and loads weights from safetensors data.
 func LoadModel(runner *CUDARunner, meta *model.ModelMeta, intermediateSize int) (*CUDAModel, error) {
+	dtypeFlag := C.int(0) // GOLLMGO_DTYPE_FP16
+	if meta.Dtype == "bf16" || meta.Dtype == "BF16" || meta.Dtype == "bfloat16" {
+		dtypeFlag = C.int(1) // GOLLMGO_DTYPE_BF16
+	}
+
 	cfg := C.gollmgo_model_config_t{
 		num_layers:        C.int(meta.NumLayers),
 		hidden_size:       C.int(meta.HiddenSize),
@@ -36,6 +41,7 @@ func LoadModel(runner *CUDARunner, meta *model.ModelMeta, intermediateSize int) 
 		max_seq_len:       C.int(meta.MaxSeqLen),
 		head_dim:          C.int(0),
 		rms_norm_eps:      C.float(1e-5),
+		dtype:             dtypeFlag,
 	}
 
 	var handle C.gollmgo_model_t
