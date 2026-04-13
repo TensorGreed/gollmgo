@@ -1,0 +1,55 @@
+name: Benchmark Regression
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'internal/scheduler/**'
+      - 'internal/engine/**'
+      - 'internal/kvcache/**'
+      - 'kernels/**'
+      - 'internal/backend/**'
+
+jobs:
+  unit-benchmarks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.2'
+      - name: Run Go benchmarks
+        run: |
+          go test -bench=. -benchmem -count=3 -timeout=10m ./internal/scheduler/... ./internal/kvcache/... ./internal/engine/... | tee bench_current.txt
+      - name: Compare benchmarks
+        uses: bencherdev/bencher@main
+        continue-on-error: true
+        with:
+          command: cat bench_current.txt
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: bench_current.txt
+
+  # GPU benchmarks run on self-hosted runner (when available)
+  gpu-benchmarks:
+    runs-on: [self-hosted, gpu]
+    if: contains(github.event.pull_request.labels.*.name, 'run-gpu-bench')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.2'
+      - name: Build
+        run: make build
+      - name: Run serving benchmark
+        run: |
+          bin/gollmgo bench --mode serving --config bench/baseline_config.json --url http://localhost:8080 > bench/results/current.json
+      - name: Check regression
+        run: bash bench/check_regression.sh bench/results/current.json
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-benchmark-results
+          path: bench/results/current.json

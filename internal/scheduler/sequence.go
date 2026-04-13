@@ -57,6 +57,13 @@ func NextSeqID() uint64 {
 	return seqIDCounter.Add(1)
 }
 
+// SwapState holds saved state for PreemptSwap mode so a sequence can resume
+// without full recomputation.
+type SwapState struct {
+	SavedPrefillConsumed int
+	SavedGeneratedLen    int
+}
+
 // Sequence tracks the state of one inference request through the scheduler.
 type Sequence struct {
 	ID           uint64
@@ -69,6 +76,16 @@ type Sequence struct {
 
 	// Chunked prefill tracking.
 	PrefillConsumed int // how many prompt tokens have been processed so far
+
+	// Priority for priority-based scheduling (higher = more important, default 0).
+	Priority int
+
+	// Age tracks how many ticks this sequence has spent in the waiting queue.
+	// Used for starvation prevention in SJF and other policies.
+	Age int
+
+	// SwapState holds saved prefill/generation progress for PreemptSwap mode.
+	SwapState *SwapState
 
 	// Timestamps for latency metrics.
 	CreatedAt     time.Time // when the sequence was created (for TTFT)
