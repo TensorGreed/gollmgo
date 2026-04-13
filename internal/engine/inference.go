@@ -10,19 +10,19 @@ import (
 	"github.com/TensorGreed/gollmgo/internal/scheduler"
 )
 
-// InferenceEngine is the real Engine implementation that orchestrates
-// scheduler, backend runner, and sampling to produce tokens.
+// InferenceEngine is a simple Engine implementation for testing.
+// It exposes RunStep for manual step-by-step driving.
 type InferenceEngine struct {
 	runner    backend.Runner
 	tokenizer model.Tokenizer
 	sampler   *Sampler
 	eosID     int32
 
-	mu        sync.Mutex
-	sequences map[uint64]*scheduler.Sequence
-	pending   []*scheduler.Sequence // waiting for scheduling
-	results   []TokenResult         // generated tokens ready for consumption
-	stopped   bool
+	mu          sync.Mutex
+	sequences   map[uint64]*scheduler.Sequence
+	pending     []*scheduler.Sequence
+	subscribers map[uint64]chan TokenResult
+	stopped     bool
 }
 
 // InferenceEngineConfig holds configuration for the engine.
@@ -30,37 +30,39 @@ type InferenceEngineConfig struct {
 	Runner    backend.Runner
 	Tokenizer model.Tokenizer
 	Sampling  SamplingParams
-	MaxTokens int
 }
 
-// NewInferenceEngine creates a real inference engine.
+// NewInferenceEngine creates a simple inference engine for tests.
 func NewInferenceEngine(cfg InferenceEngineConfig) *InferenceEngine {
 	return &InferenceEngine{
-		runner:    cfg.Runner,
-		tokenizer: cfg.Tokenizer,
-		sampler:   NewSampler(cfg.Sampling),
-		eosID:     cfg.Tokenizer.EOSTokenID(),
-		sequences: make(map[uint64]*scheduler.Sequence),
+		runner:      cfg.Runner,
+		tokenizer:   cfg.Tokenizer,
+		sampler:     NewSampler(cfg.Sampling),
+		eosID:       cfg.Tokenizer.EOSTokenID(),
+		sequences:   make(map[uint64]*scheduler.Sequence),
+		subscribers: make(map[uint64]chan TokenResult),
 	}
 }
 
-func (e *InferenceEngine) Enqueue(_ context.Context, req *Request) error {
+func (e *InferenceEngine) Enqueue(_ context.Context, req *Request) (*RequestHandle, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	if e.stopped {
-		return fmt.Errorf("engine: stopped")
+		return nil, fmt.Errorf("engine: stopped")
 	}
 
 	seq := scheduler.NewSequence(req.ID, req.TokenIDs, req.MaxTokens)
 	e.sequences[seq.ID] = seq
 	e.pending = append(e.pending, seq)
-	return nil
+
+	ch := make(chan TokenResult, req.MaxTokens+1)
+	e.subscribers[seq.ID] = ch
+
+	return &RequestHandle{SeqID: seq.ID, Tokens: ch}, nil
 }
 
-// RunStep executes one inference step: builds a batch from pending/active
-// sequences, runs the backend, samples tokens, and produces results.
-// This is called by the serving loop (or directly in tests).
+// RunStep executes one inference step manually. For test use.
 func (e *InferenceEngine) RunStep(ctx context.Context) error {
 	e.mu.Lock()
 	if e.stopped {
@@ -68,17 +70,14 @@ func (e *InferenceEngine) RunStep(ctx context.Context) error {
 		return fmt.Errorf("engine: stopped")
 	}
 
-	// Collect sequences to process.
 	var active []*scheduler.Sequence
 
-	// Move pending to prefilling.
 	for _, seq := range e.pending {
 		seq.Transition(scheduler.SeqPrefilling)
 		active = append(active, seq)
 	}
 	e.pending = nil
 
-	// Also include sequences in decoding state.
 	for _, seq := range e.sequences {
 		if seq.State == scheduler.SeqDecoding {
 			active = append(active, seq)
@@ -90,16 +89,13 @@ func (e *InferenceEngine) RunStep(ctx context.Context) error {
 		return nil
 	}
 
-	// Build the backend batch.
 	batch := e.buildBatch(active)
 
-	// Run forward pass.
 	output, err := e.runner.Step(ctx, batch)
 	if err != nil {
 		return fmt.Errorf("engine: step failed: %w", err)
 	}
 
-	// Sample tokens and update state.
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -109,10 +105,8 @@ func (e *InferenceEngine) RunStep(ctx context.Context) error {
 		}
 
 		tokenID := e.sampler.Sample(output.Logits[i])
-
 		seq.AppendToken(tokenID)
 
-		// Transition prefilling -> decoding after first output.
 		if seq.State == scheduler.SeqPrefilling {
 			seq.Transition(scheduler.SeqDecoding)
 		}
@@ -122,13 +116,21 @@ func (e *InferenceEngine) RunStep(ctx context.Context) error {
 			seq.Transition(scheduler.SeqFinished)
 		}
 
-		e.results = append(e.results, TokenResult{
+		result := TokenResult{
 			SequenceID: seq.ID,
 			TokenID:    tokenID,
 			Finished:   finished,
-		})
+		}
+
+		if ch, ok := e.subscribers[seq.ID]; ok {
+			ch <- result
+		}
 
 		if finished {
+			if ch, ok := e.subscribers[seq.ID]; ok {
+				close(ch)
+				delete(e.subscribers, seq.ID)
+			}
 			delete(e.sequences, seq.ID)
 		}
 	}
@@ -147,16 +149,13 @@ func (e *InferenceEngine) buildBatch(seqs []*scheduler.Sequence) *backend.Batch 
 		batch.IsPrefill = append(batch.IsPrefill, seq.State == scheduler.SeqPrefilling)
 
 		if seq.State == scheduler.SeqPrefilling {
-			// Prefill: send all prompt tokens.
 			for i, tok := range seq.TokenIDs[:seq.PromptLen] {
 				batch.TokenIDs = append(batch.TokenIDs, tok)
 				batch.Positions = append(batch.Positions, int32(i))
 			}
 		} else {
-			// Decode: send only the last generated token.
 			lastPos := seq.TotalLen() - 1
-			lastTok := seq.TokenIDs[lastPos]
-			batch.TokenIDs = append(batch.TokenIDs, lastTok)
+			batch.TokenIDs = append(batch.TokenIDs, seq.TokenIDs[lastPos])
 			batch.Positions = append(batch.Positions, int32(lastPos))
 		}
 	}
@@ -164,22 +163,14 @@ func (e *InferenceEngine) buildBatch(seqs []*scheduler.Sequence) *backend.Batch 
 	return batch
 }
 
-func (e *InferenceEngine) NextTokens(_ context.Context) ([]TokenResult, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	if len(e.results) == 0 {
-		return nil, nil
-	}
-	out := e.results
-	e.results = nil
-	return out, nil
-}
-
 func (e *InferenceEngine) Stop() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.stopped = true
+	for id, ch := range e.subscribers {
+		close(ch)
+		delete(e.subscribers, id)
+	}
 	return nil
 }
 

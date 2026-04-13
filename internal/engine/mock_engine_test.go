@@ -5,42 +5,42 @@ import (
 	"testing"
 )
 
-func TestMockEngineEnqueueAndQueueLen(t *testing.T) {
+func TestMockEngineEnqueue(t *testing.T) {
 	e := &MockEngine{}
-	if err := e.Enqueue(context.Background(), &Request{ID: "r1"}); err != nil {
+	handle, err := e.Enqueue(context.Background(), &Request{ID: "r1", MaxTokens: 5})
+	if err != nil {
 		t.Fatalf("enqueue failed: %v", err)
 	}
-	if e.QueueLen() != 1 {
-		t.Fatalf("expected queue len 1, got %d", e.QueueLen())
+	if handle == nil {
+		t.Fatal("expected non-nil handle")
+	}
+	if handle.Tokens == nil {
+		t.Fatal("expected non-nil Tokens channel")
 	}
 }
 
-func TestMockEngineNextTokens(t *testing.T) {
+func TestMockEnginePushAndReceive(t *testing.T) {
 	e := &MockEngine{}
+	handle, _ := e.Enqueue(context.Background(), &Request{ID: "r1", MaxTokens: 5})
 
-	// Empty returns nil.
-	tokens, err := e.NextTokens(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if tokens != nil {
-		t.Fatal("expected nil from empty engine")
-	}
+	e.PushResultsTo("r1", []TokenResult{
+		{SequenceID: 1, TokenID: 42, Finished: false},
+		{SequenceID: 1, TokenID: 43, Finished: true},
+	})
 
-	// Push and drain.
-	e.PushResults([]TokenResult{{SequenceID: 1, TokenID: 42, Finished: false}})
-	tokens, err = e.NextTokens(context.Background())
-	if err != nil {
-		t.Fatal(err)
+	tok := <-handle.Tokens
+	if tok.TokenID != 42 {
+		t.Fatalf("expected token 42, got %d", tok.TokenID)
 	}
-	if len(tokens) != 1 || tokens[0].TokenID != 42 {
-		t.Fatalf("unexpected tokens: %+v", tokens)
+	tok = <-handle.Tokens
+	if tok.TokenID != 43 || !tok.Finished {
+		t.Fatalf("expected finished token 43, got %+v", tok)
 	}
 
-	// Should be empty again.
-	tokens, _ = e.NextTokens(context.Background())
-	if tokens != nil {
-		t.Fatal("expected nil after drain")
+	// Channel should be closed after finished result.
+	_, ok := <-handle.Tokens
+	if ok {
+		t.Fatal("expected channel to be closed")
 	}
 }
 

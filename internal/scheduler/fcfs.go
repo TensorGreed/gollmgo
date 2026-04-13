@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 )
 
@@ -73,17 +74,23 @@ func (s *FCFSScheduler) Tick(_ context.Context) (*SchedulerOutput, error) {
 	batchSize := 0
 	tokenBudget := s.cfg.MaxTokenBudget
 
-	// 1. Collect active decode sequences first (they each cost 1 token).
-	for _, seq := range s.active {
+	// 1. Collect active decode sequences in deterministic order (by seq ID).
+	decodeIDs := make([]uint64, 0, len(s.active))
+	for id, seq := range s.active {
 		if seq.State == SeqDecoding {
-			if batchSize >= s.cfg.MaxBatchSize {
-				break
-			}
-			out.ScheduledSequences = append(out.ScheduledSequences, seq)
-			out.DecodeBudgetUsed++
-			tokenBudget--
-			batchSize++
+			decodeIDs = append(decodeIDs, id)
 		}
+	}
+	sort.Slice(decodeIDs, func(i, j int) bool { return decodeIDs[i] < decodeIDs[j] })
+
+	for _, id := range decodeIDs {
+		if batchSize >= s.cfg.MaxBatchSize {
+			break
+		}
+		out.ScheduledSequences = append(out.ScheduledSequences, s.active[id])
+		out.DecodeBudgetUsed++
+		tokenBudget--
+		batchSize++
 	}
 
 	// 2. Admit new sequences from waiting queue (FCFS order).

@@ -1,18 +1,17 @@
 package kvcache
 
-import "fmt"
+import (
+	"fmt"
+	"sync"
+)
 
 // BlockPool is a fixed-size pool of KV cache blocks with refcounting.
-// Blocks are identified by integer IDs [0, totalBlocks).
-// Refcount semantics:
-//   - Allocate sets refcount to 1.
-//   - Ref increments refcount (for prefix sharing).
-//   - Release decrements refcount; block returns to free list at 0.
-//   - Free is a bulk release that ignores refcounts (for preemption cleanup).
+// All methods are safe for concurrent use.
 type BlockPool struct {
+	mu          sync.Mutex
 	blockSize   int
 	totalBlocks int
-	refcounts   []int32 // per-block refcount; 0 = free
+	refcounts   []int32
 	freeList    []BlockID
 }
 
@@ -24,7 +23,6 @@ func NewBlockPool(totalBlocks, blockSize int) *BlockPool {
 		refcounts:   make([]int32, totalBlocks),
 		freeList:    make([]BlockID, 0, totalBlocks),
 	}
-	// All blocks start free.
 	for i := 0; i < totalBlocks; i++ {
 		pool.freeList = append(pool.freeList, BlockID(i))
 	}
@@ -32,18 +30,18 @@ func NewBlockPool(totalBlocks, blockSize int) *BlockPool {
 }
 
 func (p *BlockPool) Allocate(n int) ([]BlockID, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if n <= 0 {
 		return nil, nil
 	}
 	if n > len(p.freeList) {
 		return nil, fmt.Errorf("%w: need %d, have %d", ErrOutOfBlocks, n, len(p.freeList))
 	}
-	// Take from the end (stack-like, cache friendly).
 	allocated := make([]BlockID, n)
 	start := len(p.freeList) - n
 	copy(allocated, p.freeList[start:])
 	p.freeList = p.freeList[:start]
-
 	for _, id := range allocated {
 		p.refcounts[id] = 1
 	}
@@ -51,6 +49,8 @@ func (p *BlockPool) Allocate(n int) ([]BlockID, error) {
 }
 
 func (p *BlockPool) Free(blocks []BlockID) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	for _, id := range blocks {
 		if id < 0 || int(id) >= p.totalBlocks {
 			continue
@@ -63,12 +63,16 @@ func (p *BlockPool) Free(blocks []BlockID) {
 }
 
 func (p *BlockPool) Ref(block BlockID) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if block >= 0 && int(block) < p.totalBlocks && p.refcounts[block] > 0 {
 		p.refcounts[block]++
 	}
 }
 
 func (p *BlockPool) Release(block BlockID) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if block < 0 || int(block) >= p.totalBlocks {
 		return
 	}
@@ -81,11 +85,18 @@ func (p *BlockPool) Release(block BlockID) {
 	}
 }
 
-func (p *BlockPool) NumFreeBlocks() int  { return len(p.freeList) }
+func (p *BlockPool) NumFreeBlocks() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.freeList)
+}
+
 func (p *BlockPool) NumTotalBlocks() int { return p.totalBlocks }
 func (p *BlockPool) BlockSize() int      { return p.blockSize }
 
 func (p *BlockPool) Utilization() float64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if p.totalBlocks == 0 {
 		return 0
 	}
@@ -94,6 +105,8 @@ func (p *BlockPool) Utilization() float64 {
 
 // RefCount returns the refcount of a block (for testing/debugging).
 func (p *BlockPool) RefCount(block BlockID) int32 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if block < 0 || int(block) >= p.totalBlocks {
 		return -1
 	}

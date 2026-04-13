@@ -202,46 +202,59 @@ func runOfflineBench(log *slog.Logger, numPrompts, promptLen, outputLen int) {
 
 	start := time.Now()
 
-	// Enqueue all prompts.
+	// Enqueue all prompts, collecting handles. Track failures.
+	type pendingReq struct {
+		handle *engine.RequestHandle
+	}
+	var pending []pendingReq
+	enqueueErrors := 0
+
 	for i := 0; i < numPrompts; i++ {
 		prompt := make([]int32, promptLen)
 		for j := range prompt {
 			prompt[j] = int32((j + i) % 255)
 		}
-		eng.Enqueue(ctx, &engine.Request{
+		handle, err := eng.Enqueue(ctx, &engine.Request{
 			ID:        fmt.Sprintf("bench-%d", i),
 			TokenIDs:  prompt,
 			MaxTokens: outputLen,
 		})
+		if err != nil {
+			enqueueErrors++
+			log.Warn("enqueue failed", "prompt", i, "error", err)
+			continue
+		}
+		pending = append(pending, pendingReq{handle: handle})
 	}
 
-	// Wait for completion.
+	if enqueueErrors > 0 {
+		log.Warn("enqueue failures", "failed", enqueueErrors, "succeeded", len(pending))
+	}
+
+	// Wait for completion by draining each handle's channel.
 	completed := 0
-	for completed < numPrompts {
-		tokens, _ := eng.NextTokens(ctx)
-		for _, tok := range tokens {
-			if tok.Finished {
+	for _, p := range pending {
+		for tok := range p.handle.Tokens {
+			if tok.Finished || tok.Err != nil {
 				completed++
+				break
 			}
-		}
-		if len(tokens) == 0 {
-			time.Sleep(100 * time.Microsecond)
 		}
 	}
 
 	elapsed := time.Since(start)
-	totalTokens := numPrompts * outputLen // approximate
+	totalTokens := completed * outputLen // approximate
 	eng.Stop()
 
 	// Print results.
 	result := BenchResult{
 		Mode:            "offline",
-		NumPrompts:      numPrompts,
+		NumPrompts:      completed,
 		PromptLen:       promptLen,
 		OutputLen:       outputLen,
 		ElapsedSeconds:  elapsed.Seconds(),
 		TokensPerSecond: float64(totalTokens) / elapsed.Seconds(),
-		RequestsPerSec:  float64(numPrompts) / elapsed.Seconds(),
+		RequestsPerSec:  float64(completed) / elapsed.Seconds(),
 	}
 	data, _ := json.MarshalIndent(result, "", "  ")
 	fmt.Println(string(data))

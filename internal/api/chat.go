@@ -141,7 +141,6 @@ func (s *Server) ChatCompletionsHandler() http.HandlerFunc {
 			maxTokens = 256
 		}
 
-		// Build a placeholder prompt string for the engine.
 		prompt := ""
 		for _, m := range req.Messages {
 			prompt += m.Content + " "
@@ -153,48 +152,61 @@ func (s *Server) ChatCompletionsHandler() http.HandlerFunc {
 			MaxTokens: maxTokens,
 		}
 
+		// Enqueue and get a per-request handle. Tokens arrive on
+		// handle.Tokens — isolated from every other request.
+		handle, err := s.engine.Enqueue(r.Context(), engineReq)
+		if err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, APIError{Error: APIErrorBody{
+				Message: "engine unavailable: " + err.Error(),
+				Type:    "server_error",
+				Code:    "engine_error",
+			}})
+			return
+		}
+
 		if req.Stream {
-			s.handleStream(w, r, &req, engineReq)
+			s.handleStream(w, r, &req, engineReq, handle)
 		} else {
-			s.handleNonStream(w, r, &req, engineReq)
+			s.handleNonStream(w, r, &req, engineReq, handle)
 		}
 	}
 }
 
-func (s *Server) handleNonStream(w http.ResponseWriter, r *http.Request, req *ChatCompletionRequest, engineReq *engine.Request) {
-	if err := s.engine.Enqueue(r.Context(), engineReq); err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, APIError{Error: APIErrorBody{
-			Message: "engine unavailable: " + err.Error(),
-			Type:    "server_error",
-			Code:    "engine_error",
-		}})
-		return
-	}
-
-	// Collect all tokens until finished.
+func (s *Server) handleNonStream(w http.ResponseWriter, r *http.Request, req *ChatCompletionRequest, engineReq *engine.Request, handle *engine.RequestHandle) {
 	var generated []int32
+
+	// Block on the per-request channel until finished, error, or context done.
 	for {
-		tokens, err := s.engine.NextTokens(r.Context())
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, APIError{Error: APIErrorBody{
-				Message: "generation error: " + err.Error(),
+		select {
+		case <-r.Context().Done():
+			writeJSON(w, http.StatusGatewayTimeout, APIError{Error: APIErrorBody{
+				Message: "request cancelled",
 				Type:    "server_error",
-				Code:    "generation_error",
+				Code:    "cancelled",
 			}})
 			return
-		}
-		finished := false
-		for _, tok := range tokens {
+
+		case tok, ok := <-handle.Tokens:
+			if !ok {
+				// Channel closed without a Finished token — engine shutdown.
+				goto done
+			}
+			if tok.Err != nil {
+				writeJSON(w, http.StatusInternalServerError, APIError{Error: APIErrorBody{
+					Message: "generation error: " + tok.Err.Error(),
+					Type:    "server_error",
+					Code:    "generation_error",
+				}})
+				return
+			}
 			generated = append(generated, tok.TokenID)
 			if tok.Finished {
-				finished = true
+				goto done
 			}
-		}
-		if finished || len(tokens) == 0 {
-			break
 		}
 	}
 
+done:
 	resp := ChatCompletionResponse{
 		ID:      engineReq.ID,
 		Object:  "chat.completion",
@@ -214,22 +226,13 @@ func (s *Server) handleNonStream(w http.ResponseWriter, r *http.Request, req *Ch
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func (s *Server) handleStream(w http.ResponseWriter, r *http.Request, req *ChatCompletionRequest, engineReq *engine.Request) {
+func (s *Server) handleStream(w http.ResponseWriter, r *http.Request, req *ChatCompletionRequest, engineReq *engine.Request, handle *engine.RequestHandle) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeJSON(w, http.StatusInternalServerError, APIError{Error: APIErrorBody{
 			Message: "streaming not supported",
 			Type:    "server_error",
 			Code:    "streaming_unsupported",
-		}})
-		return
-	}
-
-	if err := s.engine.Enqueue(r.Context(), engineReq); err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, APIError{Error: APIErrorBody{
-			Message: "engine unavailable: " + err.Error(),
-			Type:    "server_error",
-			Code:    "engine_error",
 		}})
 		return
 	}
@@ -251,19 +254,23 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request, req *ChatC
 		}},
 	})
 
+	// Block on per-request channel for each token.
 	for {
-		tokens, err := s.engine.NextTokens(r.Context())
-		if err != nil {
-			break
-		}
-		finished := false
-		for _, tok := range tokens {
+		select {
+		case <-r.Context().Done():
+			goto done
+		case tok, ok := <-handle.Tokens:
+			if !ok {
+				goto done
+			}
+			if tok.Err != nil {
+				goto done
+			}
 			content := placeholderDetokenize([]int32{tok.TokenID})
 			var finishReason *string
 			if tok.Finished {
 				s := "stop"
 				finishReason = &s
-				finished = true
 			}
 			writeSSE(w, flusher, StreamChunk{
 				ID:      engineReq.ID,
@@ -276,12 +283,13 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request, req *ChatC
 					FinishReason: finishReason,
 				}},
 			})
-		}
-		if finished || len(tokens) == 0 {
-			break
+			if tok.Finished {
+				goto done
+			}
 		}
 	}
 
+done:
 	fmt.Fprintf(w, "data: [DONE]\n\n")
 	flusher.Flush()
 }
@@ -300,7 +308,6 @@ func writeSSE(w http.ResponseWriter, flusher http.Flusher, chunk StreamChunk) {
 	flusher.Flush()
 }
 
-// placeholderTokenize is a stub until real tokenizer is wired in.
 func placeholderTokenize(text string) []int32 {
 	ids := make([]int32, len(text))
 	for i, b := range []byte(text) {
@@ -309,7 +316,6 @@ func placeholderTokenize(text string) []int32 {
 	return ids
 }
 
-// placeholderDetokenize is a stub until real tokenizer is wired in.
 func placeholderDetokenize(ids []int32) string {
 	bs := make([]byte, len(ids))
 	for i, id := range ids {

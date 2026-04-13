@@ -28,7 +28,6 @@ type ServingEngine struct {
 	mu          sync.Mutex
 	blockTables map[uint64]*kvcache.BlockTable // seqID -> block table
 	subscribers map[uint64]chan TokenResult     // seqID -> token delivery channel
-	results     []TokenResult                  // buffered results for NextTokens
 	stopped     bool
 	loopDone    chan struct{}
 }
@@ -43,7 +42,7 @@ type ServingEngineConfig struct {
 	Log         *slog.Logger
 }
 
-// NewServingEngine creates and starts the continuous batching loop.
+// NewServingEngine creates the engine. Call Start to begin the batching loop.
 func NewServingEngine(cfg ServingEngineConfig) *ServingEngine {
 	e := &ServingEngine{
 		runner:      cfg.Runner,
@@ -57,10 +56,7 @@ func NewServingEngine(cfg ServingEngineConfig) *ServingEngine {
 		subscribers: make(map[uint64]chan TokenResult),
 		loopDone:    make(chan struct{}),
 	}
-
-	// Update cache metrics.
 	metrics.Global.KVCacheBlocksTotal.Store(int64(cfg.Cache.NumTotalBlocks()))
-
 	return e
 }
 
@@ -86,7 +82,6 @@ func (e *ServingEngine) loop(ctx context.Context) {
 		}
 		e.mu.Unlock()
 
-		// Run one scheduler tick.
 		out, err := e.sched.Tick(ctx)
 		if err != nil {
 			e.log.Error("scheduler tick failed", "error", err)
@@ -94,13 +89,13 @@ func (e *ServingEngine) loop(ctx context.Context) {
 		}
 
 		if len(out.ScheduledSequences) == 0 {
-			// No work to do. Brief sleep to avoid busy-spinning.
 			time.Sleep(100 * time.Microsecond)
 			continue
 		}
 
 		if err := e.runStep(ctx, out); err != nil {
-			e.log.Error("step failed", "error", err)
+			e.log.Error("step failed, recovering sequences", "error", err)
+			e.recoverFromStepFailure(out.ScheduledSequences)
 		}
 	}
 }
@@ -108,7 +103,6 @@ func (e *ServingEngine) loop(ctx context.Context) {
 func (e *ServingEngine) runStep(ctx context.Context, schedOut *scheduler.SchedulerOutput) error {
 	seqs := schedOut.ScheduledSequences
 
-	// Build batch with slot mappings from block tables.
 	batch := &backend.Batch{
 		SequenceIDs: make([]uint64, 0, len(seqs)),
 		IsPrefill:   make([]bool, 0, len(seqs)),
@@ -120,7 +114,6 @@ func (e *ServingEngine) runStep(ctx context.Context, schedOut *scheduler.Schedul
 		isPrefill := seq.State == scheduler.SeqPrefilling
 		batch.IsPrefill = append(batch.IsPrefill, isPrefill)
 
-		// Ensure block table exists.
 		bt, ok := e.blockTables[seq.ID]
 		if !ok {
 			bt = kvcache.NewBlockTable(seq.ID, e.cache)
@@ -128,7 +121,6 @@ func (e *ServingEngine) runStep(ctx context.Context, schedOut *scheduler.Schedul
 		}
 
 		if isPrefill {
-			// Prefill: send all prompt tokens, allocate slots.
 			for i := 0; i < seq.PromptLen; i++ {
 				slot, err := bt.Append()
 				if err != nil {
@@ -140,7 +132,6 @@ func (e *ServingEngine) runStep(ctx context.Context, schedOut *scheduler.Schedul
 				batch.SlotMapping = append(batch.SlotMapping, slot)
 			}
 		} else {
-			// Decode: send last token, allocate one slot.
 			slot, err := bt.Append()
 			if err != nil {
 				e.mu.Unlock()
@@ -154,7 +145,6 @@ func (e *ServingEngine) runStep(ctx context.Context, schedOut *scheduler.Schedul
 	}
 	e.mu.Unlock()
 
-	// Run forward pass.
 	output, err := e.runner.Step(ctx, batch)
 	if err != nil {
 		return fmt.Errorf("runner step: %w", err)
@@ -162,7 +152,6 @@ func (e *ServingEngine) runStep(ctx context.Context, schedOut *scheduler.Schedul
 
 	metrics.Global.BatchesRun.Add(1)
 
-	// Sample tokens and deliver results.
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -175,7 +164,6 @@ func (e *ServingEngine) runStep(ctx context.Context, schedOut *scheduler.Schedul
 		seq.AppendToken(tokenID)
 		metrics.Global.TokensGenerated.Add(1)
 
-		// Transition prefill -> decode.
 		if seq.State == scheduler.SeqPrefilling {
 			seq.Transition(scheduler.SeqDecoding)
 		}
@@ -191,10 +179,6 @@ func (e *ServingEngine) runStep(ctx context.Context, schedOut *scheduler.Schedul
 			Finished:   finished,
 		}
 
-		// Buffer for NextTokens.
-		e.results = append(e.results, result)
-
-		// Deliver to subscriber (for streaming).
 		if ch, ok := e.subscribers[seq.ID]; ok {
 			select {
 			case ch <- result:
@@ -207,55 +191,65 @@ func (e *ServingEngine) runStep(ctx context.Context, schedOut *scheduler.Schedul
 		}
 	}
 
-	// Update cache metrics.
 	used := int64(e.cache.NumTotalBlocks() - e.cache.NumFreeBlocks())
 	metrics.Global.KVCacheBlocksUsed.Store(used)
-
 	return nil
 }
 
-// Enqueue submits a request and returns a channel for token delivery.
-func (e *ServingEngine) Enqueue(_ context.Context, req *Request) error {
+// recoverFromStepFailure handles sequences that were in-flight when
+// runner.Step() failed. Sequences in PREFILLING are failed with an error
+// (they haven't produced any tokens so there's nothing to resume).
+// Sequences in DECODING are failed too — their KV state may be inconsistent.
+func (e *ServingEngine) recoverFromStepFailure(seqs []*scheduler.Sequence) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	for _, seq := range seqs {
+		errResult := TokenResult{
+			SequenceID: seq.ID,
+			Finished:   true,
+			Err:        fmt.Errorf("backend step failed"),
+		}
+
+		if ch, ok := e.subscribers[seq.ID]; ok {
+			select {
+			case ch <- errResult:
+			default:
+			}
+		}
+
+		e.cleanupSequence(seq.ID)
+	}
+}
+
+// Enqueue submits a request and returns a handle for receiving that
+// request's tokens. The returned channel is dedicated to this request.
+func (e *ServingEngine) Enqueue(_ context.Context, req *Request) (*RequestHandle, error) {
 	seq := scheduler.NewSequence(req.ID, req.TokenIDs, req.MaxTokens)
 
 	e.mu.Lock()
 	if e.stopped {
 		e.mu.Unlock()
-		return fmt.Errorf("engine: stopped")
+		return nil, fmt.Errorf("engine: stopped")
 	}
 	ch := make(chan TokenResult, req.MaxTokens+1)
 	e.subscribers[seq.ID] = ch
 	e.mu.Unlock()
 
-	return e.sched.Add(seq)
-}
-
-// Subscribe returns the token delivery channel for a given request ID.
-// Must be called after Enqueue. Returns nil if not found.
-func (e *ServingEngine) Subscribe(seqID uint64) <-chan TokenResult {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.subscribers[seqID]
-}
-
-// NextTokens drains all buffered results (Engine interface).
-// For serving, prefer Subscribe for per-request streaming.
-func (e *ServingEngine) NextTokens(_ context.Context) ([]TokenResult, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	if len(e.results) == 0 {
-		return nil, nil
+	if err := e.sched.Add(seq); err != nil {
+		e.mu.Lock()
+		delete(e.subscribers, seq.ID)
+		close(ch)
+		e.mu.Unlock()
+		return nil, err
 	}
-	out := e.results
-	e.results = nil
-	return out, nil
+
+	return &RequestHandle{SeqID: seq.ID, Tokens: ch}, nil
 }
 
 func (e *ServingEngine) Stop() error {
 	e.mu.Lock()
 	e.stopped = true
-	// Close all subscriber channels.
 	for id, ch := range e.subscribers {
 		close(ch)
 		delete(e.subscribers, id)
@@ -267,17 +261,14 @@ func (e *ServingEngine) Stop() error {
 }
 
 func (e *ServingEngine) cleanupSequence(seqID uint64) {
-	// Free block table.
 	if bt, ok := e.blockTables[seqID]; ok {
 		bt.Free()
 		delete(e.blockTables, seqID)
 	}
-	// Close and remove subscriber.
 	if ch, ok := e.subscribers[seqID]; ok {
 		close(ch)
 		delete(e.subscribers, seqID)
 	}
-	// Remove from scheduler.
 	e.sched.Complete(seqID)
 }
 

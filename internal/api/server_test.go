@@ -128,14 +128,22 @@ func TestChatCompletionsNegativeMaxTokens(t *testing.T) {
 func TestChatCompletionsNonStreaming(t *testing.T) {
 	s, eng := newTestServer(t)
 
-	eng.PushResults([]engine.TokenResult{
-		{SequenceID: 1, TokenID: 72, Finished: false},
-		{SequenceID: 1, TokenID: 105, Finished: true},
-	})
-
 	body := `{"model":"test","messages":[{"role":"user","content":"hello"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	rec := httptest.NewRecorder()
+
+	// Push results asynchronously after the engine registers the request.
+	go func() {
+		for len(eng.PendingRequestIDs()) == 0 {
+			// spin until enqueued
+		}
+		ids := eng.PendingRequestIDs()
+		eng.PushResultsTo(ids[0], []engine.TokenResult{
+			{SequenceID: 1, TokenID: 72, Finished: false}, // 'H'
+			{SequenceID: 1, TokenID: 105, Finished: true},  // 'i'
+		})
+	}()
+
 	s.Handler().ServeHTTP(rec, req)
 
 	if rec.Code != 200 {
@@ -158,14 +166,20 @@ func TestChatCompletionsNonStreaming(t *testing.T) {
 func TestChatCompletionsStreaming(t *testing.T) {
 	s, eng := newTestServer(t)
 
-	eng.PushResults([]engine.TokenResult{
-		{SequenceID: 1, TokenID: 65, Finished: false},
-		{SequenceID: 1, TokenID: 66, Finished: true},
-	})
-
 	body := `{"model":"test","messages":[{"role":"user","content":"go"}],"stream":true}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	rec := httptest.NewRecorder()
+
+	go func() {
+		for len(eng.PendingRequestIDs()) == 0 {
+		}
+		ids := eng.PendingRequestIDs()
+		eng.PushResultsTo(ids[0], []engine.TokenResult{
+			{SequenceID: 1, TokenID: 65, Finished: false}, // 'A'
+			{SequenceID: 1, TokenID: 66, Finished: true},  // 'B'
+		})
+	}()
+
 	s.Handler().ServeHTTP(rec, req)
 
 	if rec.Code != 200 {
@@ -174,10 +188,10 @@ func TestChatCompletionsStreaming(t *testing.T) {
 
 	respBody := rec.Body.String()
 	if !strings.Contains(respBody, "data: ") {
-		t.Fatal("expected SSE data lines in streaming response")
+		t.Fatal("expected SSE data lines")
 	}
 	if !strings.Contains(respBody, "data: [DONE]") {
-		t.Fatal("expected [DONE] sentinel in streaming response")
+		t.Fatal("expected [DONE] sentinel")
 	}
 }
 
