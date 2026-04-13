@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"sync/atomic"
+	"time"
 )
 
 // SeqState represents the lifecycle state of a sequence.
@@ -58,13 +59,17 @@ func NextSeqID() uint64 {
 
 // Sequence tracks the state of one inference request through the scheduler.
 type Sequence struct {
-	ID          uint64
-	RequestID   string
-	State       SeqState
-	PromptLen   int
+	ID           uint64
+	RequestID    string
+	State        SeqState
+	PromptLen    int
 	GeneratedLen int
-	MaxTokens   int
-	TokenIDs    []int32 // prompt + generated so far
+	MaxTokens    int
+	TokenIDs     []int32 // prompt + generated so far
+
+	// Timestamps for latency metrics.
+	CreatedAt     time.Time // when the sequence was created (for TTFT)
+	LastTokenAt   time.Time // when the last token was emitted (for ITL)
 }
 
 // NewSequence creates a sequence in the Waiting state.
@@ -78,6 +83,7 @@ func NewSequence(requestID string, promptTokens []int32, maxTokens int) *Sequenc
 		PromptLen: len(promptTokens),
 		MaxTokens: maxTokens,
 		TokenIDs:  tokens,
+		CreatedAt: time.Now(),
 	}
 }
 

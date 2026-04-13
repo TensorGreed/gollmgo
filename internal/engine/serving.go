@@ -101,6 +101,10 @@ func (e *ServingEngine) loop(ctx context.Context) {
 			continue
 		}
 
+		// Update scheduler queue metrics after each tick.
+		metrics.Global.SchedulerQueueDepth.Store(int64(e.sched.WaitingLen()))
+		metrics.Global.SchedulerActiveCount.Store(int64(e.sched.ActiveLen()))
+
 		if len(out.ScheduledSequences) == 0 {
 			time.Sleep(100 * time.Microsecond)
 			continue
@@ -180,11 +184,23 @@ func (e *ServingEngine) runStep(ctx context.Context, schedOut *scheduler.Schedul
 		}
 
 		tokenID := e.sampler.Sample(output.Logits[i])
+		now := time.Now()
 		seq.AppendToken(tokenID)
 		metrics.Global.TokensGenerated.Add(1)
 
 		if seq.State == scheduler.SeqPrefilling {
+			// Record TTFT: time from sequence creation to first token.
+			ttftMs := float64(now.Sub(seq.CreatedAt).Microseconds()) / 1000.0
+			metrics.Global.TTFT.Record(ttftMs)
 			seq.Transition(scheduler.SeqDecoding)
+			seq.LastTokenAt = now
+		} else {
+			// Record ITL: time since last token for this sequence.
+			if !seq.LastTokenAt.IsZero() {
+				itlMs := float64(now.Sub(seq.LastTokenAt).Microseconds()) / 1000.0
+				metrics.Global.ITL.Record(itlMs)
+			}
+			seq.LastTokenAt = now
 		}
 
 		finished := tokenID == e.eosID || seq.GeneratedLen >= seq.MaxTokens

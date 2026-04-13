@@ -77,8 +77,19 @@ func TestServerMetrics(t *testing.T) {
 		t.Fatalf("expected 200, got %d", rec.Code)
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "gollmgo_requests_total") {
-		t.Fatal("expected gollmgo_requests_total in metrics output")
+	for _, expected := range []string{
+		"gollmgo_requests_total",
+		"gollmgo_kvcache_utilization",
+		"gollmgo_scheduler_queue_depth",
+		"gollmgo_scheduler_active_count",
+		"gollmgo_kvcache_hit_rate",
+		"gollmgo_graph_cache_hit_rate",
+		"gollmgo_ttft_p50_ms",
+		"gollmgo_itl_p50_ms",
+	} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("expected %q in metrics output", expected)
+		}
 	}
 }
 

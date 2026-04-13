@@ -177,6 +177,17 @@ func cmdServe(args []string) {
 	log.Info("shutdown complete")
 }
 
+// benchConfig holds frozen benchmark parameters loaded from --config.
+type benchConfig struct {
+	Benchmark struct {
+		Mode       string `json:"mode"`
+		NumPrompts int    `json:"num_prompts"`
+		PromptLen  int    `json:"prompt_len"`
+		OutputLen  int    `json:"output_len"`
+		Concurrency int   `json:"concurrency"`
+	} `json:"benchmark"`
+}
+
 func cmdBench(args []string) {
 	fs := flag.NewFlagSet("bench", flag.ExitOnError)
 	mode := fs.String("mode", "offline", "benchmark mode: offline, serving")
@@ -185,9 +196,40 @@ func cmdBench(args []string) {
 	outputLen := fs.Int("output-len", 128, "max output tokens per request")
 	concurrency := fs.Int("concurrency", 1, "concurrent requests (serving mode)")
 	targetURL := fs.String("url", "", "target server URL (serving mode)")
+	configFile := fs.String("config", "", "path to frozen benchmark config JSON (overrides flags)")
 	fs.Parse(args)
 
 	log := newLogger("info")
+
+	// If --config is provided, load frozen parameters from it.
+	if *configFile != "" {
+		data, err := os.ReadFile(*configFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error reading config: %v\n", err)
+			os.Exit(1)
+		}
+		var bc benchConfig
+		if err := json.Unmarshal(data, &bc); err != nil {
+			fmt.Fprintf(os.Stderr, "error parsing config: %v\n", err)
+			os.Exit(1)
+		}
+		if bc.Benchmark.Mode != "" {
+			*mode = bc.Benchmark.Mode
+		}
+		if bc.Benchmark.NumPrompts > 0 {
+			*numPrompts = bc.Benchmark.NumPrompts
+		}
+		if bc.Benchmark.PromptLen > 0 {
+			*promptLen = bc.Benchmark.PromptLen
+		}
+		if bc.Benchmark.OutputLen > 0 {
+			*outputLen = bc.Benchmark.OutputLen
+		}
+		if bc.Benchmark.Concurrency > 0 {
+			*concurrency = bc.Benchmark.Concurrency
+		}
+		log.Info("loaded benchmark config", "path", *configFile)
+	}
 
 	switch *mode {
 	case "offline":

@@ -1,0 +1,24 @@
+{
+  "description": "Phase 1 baseline configuration for reproducible parity runs",
+  "hardware": "DGX Spark GB10",
+  "benchmark": {
+    "mode": "serving",
+    "num_prompts": 1000,
+    "prompt_len": 128,
+    "output_len": 128,
+    "concurrency": 4,
+    "warmup_requests": 10,
+    "repetitions": 3
+  },
+  "server": {
+    "max_batch_size": 64,
+    "max_token_budget": 4096,
+    "max_queue_depth": 256,
+    "block_size": 16,
+    "max_memory_fraction": 0.9
+  },
+  "sampling": {
+    "temperature": 0
+  },
+  "notes": "Run with: gollmgo bench --mode serving --config bench/baseline_config.json --url http://localhost:8080"
+}
