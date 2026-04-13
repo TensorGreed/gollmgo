@@ -20,6 +20,7 @@ This repository supports both Claude Code and Codex workflows.
 - Preserve backend abstraction for future AMD ROCm support.
 - Keep changes benchmark-backed when touching hot paths.
 - Update docs in the same patch as behavior/config changes.
+- Standard Go baseline: `Go 1.22.2+` locally, with CI pinned to `Go 1.22.2`.
 
 ## If You Touch Critical Paths
 - Scheduler: read `skills/scheduler.md`

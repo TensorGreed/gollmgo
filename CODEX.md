@@ -16,6 +16,7 @@
 - Keep CGo/backend boundary narrow.
 - Treat benchmark regressions as release blockers.
 - Avoid runtime Python dependencies in serving path.
+- Use `Go 1.22.2+` locally; CI is pinned to `Go 1.22.2`.
 
 ## Read Order For Any Task
 1. `docs/roadmap.md`

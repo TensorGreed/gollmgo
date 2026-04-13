@@ -24,7 +24,7 @@ Each component owns its boundary. The scheduler owns sequence state. The KV cach
 
 ### Prerequisites
 
-- Go 1.23+
+- Go 1.22.2+ (CI baseline: Go 1.22.2)
 - CUDA Toolkit 12+ (13.0 tested)
 - NVIDIA GPU (developed on DGX Spark GB10)
 - `gcc` with C++17

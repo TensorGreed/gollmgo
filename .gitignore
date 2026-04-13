@@ -2,7 +2,8 @@ bin/
 *.o
 *.so
 *.a
-docs/
+docs/*
+!docs/quickstart.md
 epics/
 decisions/
 skills/

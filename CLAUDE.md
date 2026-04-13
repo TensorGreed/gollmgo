@@ -51,6 +51,8 @@ make bench            # benchmark suite
 make lint             # static checks
 ```
 
+Go baseline: `Go 1.22.2+` for local development, with CI pinned to `Go 1.22.2`.
+
 ## Hard Constraints
 - `CGO_ENABLED=1` for GPU builds.
 - No GPU allocation outside engine/kvcache ownership boundaries.
