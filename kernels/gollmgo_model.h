@@ -9,6 +9,7 @@
 #define GOLLMGO_MODEL_H
 
 #include "gollmgo_backend.h"
+#include "gollmgo_kvcache.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -71,6 +72,24 @@ gollmgo_status_t gollmgo_model_forward(gollmgo_backend_t b,
                                         float* logits_out);
 
 /*
+ * Prefill forward pass: eager attention + KV cache write.
+ * Same as gollmgo_model_forward but also writes computed K/V
+ * to the paged cache for subsequent decode steps.
+ * slot_mapping: [n_tokens] physical cache slot for each token.
+ * kv_cache: the paged KV cache handle.
+ * If kv_cache is NULL, behaves identically to gollmgo_model_forward.
+ */
+gollmgo_status_t gollmgo_model_forward_prefill(
+    gollmgo_backend_t b,
+    gollmgo_model_t m,
+    const int32_t* token_ids,
+    const int32_t* positions,
+    const int32_t* slot_mapping,
+    int n_tokens,
+    gollmgo_kvcache_t kv_cache,
+    float* logits_out);
+
+/*
  * Execute one forward pass with paged KV cache.
  *
  * This replaces gollmgo_model_forward for production serving.
@@ -95,8 +114,7 @@ gollmgo_status_t gollmgo_model_forward_paged(
     const int32_t* positions,
     const int32_t* slot_mapping,
     int n_tokens,
-    void* k_cache,             /* device pointer */
-    void* v_cache,             /* device pointer */
+    gollmgo_kvcache_t kv_cache,
     const int32_t* seq_lens,
     const int32_t* slot_tables,
     int n_seqs,

@@ -14,11 +14,30 @@ import (
 )
 
 // initGPURunner creates a CUDA runner with a loaded model.
-// Returns the runner and tokenizer. Caller must close both.
 func initGPURunner(log *slog.Logger, modelPath, tokenizerPath string, deviceID int) (backend.Runner, model.Tokenizer, error) {
 	log.Info("initializing GPU runner", "model", modelPath, "device", deviceID)
 
-	// Create CUDA runner.
+	dir := filepath.Dir(modelPath)
+
+	// --- Load config.json for authoritative model metadata ---
+	configPath := filepath.Join(dir, "config.json")
+	hfCfg, err := model.LoadHFConfig(configPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load config.json: %w", err)
+	}
+	meta := hfCfg.ToModelMeta()
+
+	log.Info("model config",
+		"family", meta.Family,
+		"layers", meta.NumLayers,
+		"hidden", meta.HiddenSize,
+		"heads", meta.NumHeads,
+		"kv_heads", meta.NumKVHeads,
+		"vocab", meta.VocabSize,
+		"max_seq_len", meta.MaxSeqLen,
+		"dtype", meta.Dtype)
+
+	// --- Create CUDA runner ---
 	runner, err := cuda.New(deviceID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("create CUDA runner: %w", err)
@@ -31,43 +50,31 @@ func initGPURunner(log *slog.Logger, modelPath, tokenizerPath string, deviceID i
 		"total_gb", fmt.Sprintf("%.1f", float64(info.TotalMemoryBytes)/(1<<30)),
 		"free_gb", fmt.Sprintf("%.1f", float64(info.FreeMemoryBytes)/(1<<30)))
 
-	// Load model weights.
+	// --- Load weights ---
 	log.Info("loading model weights", "path", modelPath)
-	tensors, meta, err := model.LoadSafetensorsWeights(modelPath)
+	tensors, _, err := model.LoadSafetensorsWeights(modelPath)
 	if err != nil {
 		runner.Close()
 		return nil, nil, fmt.Errorf("load weights: %w", err)
 	}
+	log.Info("weight tensors loaded", "count", len(tensors))
 
-	log.Info("model metadata",
-		"family", meta.Family,
-		"layers", meta.NumLayers,
-		"hidden", meta.HiddenSize,
-		"vocab", meta.VocabSize,
-		"dtype", meta.Dtype)
-
-	// Infer intermediate size from gate_proj shape.
-	intermediateSize := 0
-	for _, t := range tensors {
-		if t.Name == "model.layers.0.mlp.gate_proj.weight" && len(t.Shape) == 2 {
-			intermediateSize = t.Shape[0]
-			break
-		}
-	}
-	if intermediateSize == 0 {
-		intermediateSize = meta.HiddenSize * 4 // common default
-	}
-
-	// Create CUDA model.
-	cudaModel, err := cuda.LoadModel(runner, meta, intermediateSize)
+	// --- Create CUDA model ---
+	cudaModel, err := cuda.LoadModel(runner, meta, hfCfg.IntermediateSize)
 	if err != nil {
 		runner.Close()
 		return nil, nil, fmt.Errorf("create CUDA model: %w", err)
 	}
 
-	// Upload weights.
+	// Upload weights — convert BF16 to FP16 since kernels use __half.
 	for i, t := range tensors {
-		if err := cudaModel.LoadWeight(t.Name, t.Data, t.Dtype); err != nil {
+		data := t.Data
+		dtype := t.Dtype
+		if dtype == "BF16" {
+			data = model.ConvertBF16ToFP16(data)
+			dtype = "F16"
+		}
+		if err := cudaModel.LoadWeight(t.Name, data, dtype); err != nil {
 			cudaModel.Close()
 			runner.Close()
 			return nil, nil, fmt.Errorf("upload weight %q: %w", t.Name, err)
@@ -82,6 +89,7 @@ func initGPURunner(log *slog.Logger, modelPath, tokenizerPath string, deviceID i
 		runner.Close()
 		return nil, nil, fmt.Errorf("model ready: %w", err)
 	}
+	log.Info("model ready on GPU")
 
 	// Warmup.
 	if err := runner.Warmup(context.Background(), backend.WarmupProfile{
@@ -89,33 +97,43 @@ func initGPURunner(log *slog.Logger, modelPath, tokenizerPath string, deviceID i
 		MaxSeqLen:    meta.MaxSeqLen,
 		BlockSize:    16,
 	}); err != nil {
-		log.Warn("warmup failed (non-fatal)", "error", err)
+		log.Warn("warmup note", "error", err)
 	}
 
-	// Create runner with model.
+	// --- Create GPU KV cache ---
+	blockSize := 16
+	numBlocks := 1024 // matches the Go-side pool in cmdServe
+	numSlots := numBlocks * blockSize
+	headDim := meta.HiddenSize / meta.NumHeads
+
+	kvCache, err := cuda.NewCUDAKVCache(runner, meta.NumLayers, numSlots, hfCfg.NumKeyValueHeads, headDim)
+	if err != nil {
+		cudaModel.Close()
+		runner.Close()
+		return nil, nil, fmt.Errorf("create KV cache: %w", err)
+	}
+	log.Info("GPU KV cache created", "slots", numSlots, "kv_heads", hfCfg.NumKeyValueHeads, "head_dim", headDim)
+
+	// --- Build runner with model + KV cache ---
 	fullRunner := &cuda.CUDARunnerWithModel{
-		CUDARunner:     runner,
-		Model:          cudaModel,
-		SeqSlotTables:  make(map[uint64][]int32),
-		SeqContextLens: make(map[uint64]int32),
+		CUDARunner: runner,
+		Model:      cudaModel,
+		KVCache:    kvCache,
 	}
 
-	// Load tokenizer.
+	// --- Load tokenizer ---
 	var tokenizer model.Tokenizer
 	if tokenizerPath == "" {
-		// Try to find tokenizer.json next to the model.
-		dir := filepath.Dir(modelPath)
 		tokenizerPath = filepath.Join(dir, "tokenizer.json")
 	}
 
 	hfTok, err := model.LoadHFTokenizer(tokenizerPath, "</s>", "<s>")
 	if err != nil {
-		log.Warn("HF tokenizer load failed, falling back to byte-level",
-			"path", tokenizerPath, "error", err)
-		tokenizer = model.NewByteLevelTokenizer(meta.VocabSize, 2)
+		log.Warn("HF tokenizer failed, using byte-level fallback", "error", err)
+		tokenizer = model.NewByteLevelTokenizer(meta.VocabSize, int32(hfCfg.EosTokenID))
 	} else {
 		tokenizer = hfTok
-		log.Info("tokenizer loaded", "vocab_size", hfTok.VocabSize(), "eos_id", hfTok.EOSTokenID())
+		log.Info("tokenizer loaded", "vocab", hfTok.VocabSize(), "eos", hfTok.EOSTokenID())
 	}
 
 	return fullRunner, tokenizer, nil

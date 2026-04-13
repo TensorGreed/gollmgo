@@ -139,7 +139,7 @@ func cmdServe(args []string) {
 	eng.Start(ctx)
 
 	// Create and start API server.
-	srv := api.NewServer(cfg, eng, log)
+	srv := api.NewServer(cfg, eng, tokenizer, log)
 
 	// Graceful shutdown.
 	sigCh := make(chan os.Signal, 1)

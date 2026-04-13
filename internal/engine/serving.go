@@ -144,6 +144,7 @@ func (e *ServingEngine) runStep(ctx context.Context, schedOut *scheduler.Schedul
 				batch.Positions = append(batch.Positions, int32(i))
 				batch.SlotMapping = append(batch.SlotMapping, slot)
 			}
+			batch.SeqTokenCounts = append(batch.SeqTokenCounts, int32(seq.PromptLen))
 		} else {
 			slot, err := bt.Append()
 			if err != nil {
@@ -154,7 +155,12 @@ func (e *ServingEngine) runStep(ctx context.Context, schedOut *scheduler.Schedul
 			batch.TokenIDs = append(batch.TokenIDs, seq.TokenIDs[lastPos])
 			batch.Positions = append(batch.Positions, int32(lastPos))
 			batch.SlotMapping = append(batch.SlotMapping, slot)
+			batch.SeqTokenCounts = append(batch.SeqTokenCounts, 1)
 		}
+
+		// Per-sequence context length and full slot table.
+		batch.SeqContextLens = append(batch.SeqContextLens, int32(bt.NumTokens()))
+		batch.SeqSlotTables = append(batch.SeqSlotTables, bt.SlotMapping())
 	}
 	e.mu.Unlock()
 

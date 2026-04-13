@@ -21,10 +21,11 @@ type CUDAKVCache struct {
 }
 
 // NewCUDAKVCache creates a KV cache on the GPU.
-func NewCUDAKVCache(runner *CUDARunner, numSlots, numKVHeads, headDim int) (*CUDAKVCache, error) {
+func NewCUDAKVCache(runner *CUDARunner, numLayers, numSlots, numKVHeads, headDim int) (*CUDAKVCache, error) {
 	var handle C.gollmgo_kvcache_t
 	status := C.gollmgo_kvcache_create(
 		runner.handle,
+		C.int(numLayers),
 		C.int(numSlots),
 		C.int(numKVHeads),
 		C.int(headDim),
@@ -83,16 +84,6 @@ func (c *CUDAKVCache) Attention(q []uint16, seqLens, slotTables []int32,
 		return nil, fmt.Errorf("cuda: kvcache_attention failed (status %d)", int(status))
 	}
 	return out, nil
-}
-
-// KCacheDevPtr returns the device pointer to the K cache.
-func (c *CUDAKVCache) KCacheDevPtr() unsafe.Pointer {
-	return C.gollmgo_kvcache_k_ptr(c.handle)
-}
-
-// VCacheDevPtr returns the device pointer to the V cache.
-func (c *CUDAKVCache) VCacheDevPtr() unsafe.Pointer {
-	return C.gollmgo_kvcache_v_ptr(c.handle)
 }
 
 // Close destroys the KV cache.

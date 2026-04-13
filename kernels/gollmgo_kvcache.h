@@ -16,15 +16,23 @@ extern "C" {
 typedef struct gollmgo_kvcache* gollmgo_kvcache_t;
 
 /* Create a KV cache pool on the GPU.
+ * num_layers:   number of transformer layers
  * num_slots:    total number of KV slots (num_blocks * block_size)
  * num_kv_heads: number of KV heads
  * head_dim:     dimension per head
+ *
+ * Allocates [num_layers * num_slots * num_kv_heads * head_dim] for K and V.
  */
 gollmgo_status_t gollmgo_kvcache_create(gollmgo_backend_t b,
+                                         int num_layers,
                                          int num_slots,
                                          int num_kv_heads,
                                          int head_dim,
                                          gollmgo_kvcache_t* out);
+
+/* Get device pointers for a specific layer's K and V cache. */
+void* gollmgo_kvcache_k_layer_ptr(gollmgo_kvcache_t cache, int layer);
+void* gollmgo_kvcache_v_layer_ptr(gollmgo_kvcache_t cache, int layer);
 
 /* Write K/V for new tokens into the cache.
  * k, v:          [n_tokens, num_kv_heads, head_dim] in FP16, host memory
@@ -53,10 +61,6 @@ gollmgo_status_t gollmgo_kvcache_attention(gollmgo_kvcache_t cache,
                                             int num_heads,
                                             int max_seq_len,
                                             float scale);
-
-/* Get device pointers to K and V cache arrays (for paged forward pass). */
-void* gollmgo_kvcache_k_ptr(gollmgo_kvcache_t cache);
-void* gollmgo_kvcache_v_ptr(gollmgo_kvcache_t cache);
 
 /* Destroy the KV cache and free GPU memory. */
 gollmgo_status_t gollmgo_kvcache_destroy(gollmgo_kvcache_t cache);

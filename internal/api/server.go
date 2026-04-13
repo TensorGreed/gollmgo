@@ -10,24 +10,27 @@ import (
 
 	"github.com/TensorGreed/gollmgo/internal/config"
 	"github.com/TensorGreed/gollmgo/internal/engine"
+	"github.com/TensorGreed/gollmgo/internal/model"
 )
 
 // Server is the HTTP server for the OpenAI-compatible API.
 type Server struct {
-	cfg    config.Config
-	engine engine.Engine
-	mux    *http.ServeMux
-	srv    *http.Server
-	log    *slog.Logger
+	cfg       config.Config
+	engine    engine.Engine
+	tokenizer model.Tokenizer
+	mux       *http.ServeMux
+	srv       *http.Server
+	log       *slog.Logger
 }
 
 // NewServer creates a new API server wired to the given engine.
-func NewServer(cfg config.Config, eng engine.Engine, log *slog.Logger) *Server {
+func NewServer(cfg config.Config, eng engine.Engine, tok model.Tokenizer, log *slog.Logger) *Server {
 	s := &Server{
-		cfg:    cfg,
-		engine: eng,
-		mux:    http.NewServeMux(),
-		log:    log,
+		cfg:       cfg,
+		engine:    eng,
+		tokenizer: tok,
+		mux:       http.NewServeMux(),
+		log:       log,
 	}
 	s.registerRoutes()
 	s.srv = &http.Server{

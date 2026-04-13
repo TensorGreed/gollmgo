@@ -466,6 +466,203 @@ gollmgo_status_t gollmgo_model_forward(gollmgo_backend_t b,
     return st;
 }
 
+/* Prefill forward: eager attention + KV cache write for each layer. */
+gollmgo_status_t gollmgo_model_forward_prefill(
+    gollmgo_backend_t b,
+    gollmgo_model_t m,
+    const int32_t* host_token_ids,
+    const int32_t* host_positions,
+    const int32_t* host_slot_mapping,
+    int n_tokens,
+    gollmgo_kvcache_t kv_cache,
+    float* host_logits_out) {
+
+    if (!b || !m || !m->ready) return GOLLMGO_ERR_INVALID;
+    if (n_tokens <= 0 || n_tokens > m->max_batch) {
+        model_set_error(m, "n_tokens out of range");
+        return GOLLMGO_ERR_INVALID;
+    }
+
+    auto& c = m->config;
+    gollmgo_status_t st;
+
+    int32_t* d_token_ids = nullptr;
+    int32_t* d_positions = nullptr;
+    int32_t* d_slot_mapping = nullptr;
+
+    st = model_check_cuda(m, cudaMalloc((void**)&d_token_ids, n_tokens * sizeof(int32_t)));
+    if (st != GOLLMGO_OK) return st;
+    st = model_check_cuda(m, cudaMalloc((void**)&d_positions, n_tokens * sizeof(int32_t)));
+    if (st != GOLLMGO_OK) { cudaFree(d_token_ids); return st; }
+
+    cudaMemcpy(d_token_ids, host_token_ids, n_tokens * sizeof(int32_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_positions, host_positions, n_tokens * sizeof(int32_t), cudaMemcpyHostToDevice);
+
+    if (kv_cache && host_slot_mapping) {
+        st = model_check_cuda(m, cudaMalloc((void**)&d_slot_mapping, n_tokens * sizeof(int32_t)));
+        if (st != GOLLMGO_OK) { cudaFree(d_token_ids); cudaFree(d_positions); return st; }
+        cudaMemcpy(d_slot_mapping, host_slot_mapping, n_tokens * sizeof(int32_t), cudaMemcpyHostToDevice);
+    }
+
+    /* Embedding. */
+    {
+        int threads = (c.hidden_size < 256) ? c.hidden_size : 256;
+        dim3 grid(n_tokens, (c.hidden_size + threads - 1) / threads);
+        embedding_lookup_f16<<<grid, threads>>>(
+            get_weight(m, "model.embed_tokens.weight"),
+            d_token_ids, m->buf_hidden, c.hidden_size, c.vocab_size);
+    }
+
+    for (int layer = 0; layer < c.num_layers; layer++) {
+        char name_buf[256];
+
+        /* RMSNorm. */
+        snprintf(name_buf, sizeof(name_buf), "model.layers.%d.input_layernorm.weight", layer);
+        __half* norm_weight = get_weight(m, name_buf);
+        if (!norm_weight) { model_set_error(m, name_buf); st = GOLLMGO_ERR_INVALID; goto prefill_cleanup; }
+
+        {
+            int threads = (c.hidden_size < 256) ? c.hidden_size : 256;
+            rmsnorm_f16<<<n_tokens, threads>>>(
+                m->buf_hidden, norm_weight, m->buf_norm,
+                c.hidden_size, n_tokens, c.rms_norm_eps);
+        }
+
+        /* QKV projections. */
+        snprintf(name_buf, sizeof(name_buf), "model.layers.%d.self_attn.q_proj.weight", layer);
+        __half* wq = get_weight(m, name_buf);
+        snprintf(name_buf, sizeof(name_buf), "model.layers.%d.self_attn.k_proj.weight", layer);
+        __half* wk = get_weight(m, name_buf);
+        snprintf(name_buf, sizeof(name_buf), "model.layers.%d.self_attn.v_proj.weight", layer);
+        __half* wv = get_weight(m, name_buf);
+        if (!wq || !wk || !wv) { model_set_error(m, "missing QKV"); st = GOLLMGO_ERR_INVALID; goto prefill_cleanup; }
+
+        st = gemm_f16(m, m->buf_norm, wq, m->buf_q, n_tokens, c.num_heads * c.head_dim, c.hidden_size);
+        if (st != GOLLMGO_OK) goto prefill_cleanup;
+        st = gemm_f16(m, m->buf_norm, wk, m->buf_k, n_tokens, c.num_kv_heads * c.head_dim, c.hidden_size);
+        if (st != GOLLMGO_OK) goto prefill_cleanup;
+        st = gemm_f16(m, m->buf_norm, wv, m->buf_v, n_tokens, c.num_kv_heads * c.head_dim, c.hidden_size);
+        if (st != GOLLMGO_OK) goto prefill_cleanup;
+
+        /* RoPE. */
+        {
+            int max_heads = (c.num_heads > c.num_kv_heads) ? c.num_heads : c.num_kv_heads;
+            dim3 grid(n_tokens, max_heads);
+            rope_f16<<<grid, c.head_dim / 2>>>(
+                m->buf_q, m->buf_k, d_positions,
+                n_tokens, c.num_heads, c.num_kv_heads, c.head_dim, 10000.0f);
+        }
+
+        /* Write K/V to paged cache for this layer. */
+        if (kv_cache && d_slot_mapping) {
+            __half* lk = (__half*)gollmgo_kvcache_k_layer_ptr(kv_cache, layer);
+            __half* lv = (__half*)gollmgo_kvcache_v_layer_ptr(kv_cache, layer);
+            if (lk && lv) {
+                int kv_size = c.num_kv_heads * c.head_dim;
+                int threads = (kv_size < 256) ? kv_size : 256;
+                paged_kv_write_f16<<<n_tokens, threads>>>(
+                    lk, lv, m->buf_k, m->buf_v, d_slot_mapping,
+                    n_tokens, c.num_kv_heads, c.head_dim);
+            }
+        }
+
+        /* Naive (full) attention — correct for prefill. */
+        {
+            dim3 grid(n_tokens, c.num_heads);
+            int threads = (c.head_dim < 32) ? c.head_dim : 32;
+            int smem = n_tokens * sizeof(float);
+            naive_attention_f16<<<grid, threads, smem>>>(
+                m->buf_q, m->buf_k, m->buf_v, m->buf_attn_out,
+                d_positions, n_tokens, c.num_heads, c.num_kv_heads, c.head_dim,
+                1.0f / sqrtf((float)c.head_dim));
+        }
+
+        /* O projection + residual. */
+        snprintf(name_buf, sizeof(name_buf), "model.layers.%d.self_attn.o_proj.weight", layer);
+        __half* wo = get_weight(m, name_buf);
+        if (!wo) { model_set_error(m, "missing o_proj"); st = GOLLMGO_ERR_INVALID; goto prefill_cleanup; }
+
+        st = gemm_f16(m, m->buf_attn_out, wo, m->buf_proj,
+                       n_tokens, c.hidden_size, c.num_heads * c.head_dim);
+        if (st != GOLLMGO_OK) goto prefill_cleanup;
+
+        {
+            int total = n_tokens * c.hidden_size;
+            residual_add_f16<<<(total + 255) / 256, 256>>>(
+                m->buf_hidden, m->buf_proj, m->buf_hidden, total);
+        }
+
+        /* FFN. */
+        snprintf(name_buf, sizeof(name_buf), "model.layers.%d.post_attention_layernorm.weight", layer);
+        norm_weight = get_weight(m, name_buf);
+        if (!norm_weight) { model_set_error(m, name_buf); st = GOLLMGO_ERR_INVALID; goto prefill_cleanup; }
+
+        {
+            int threads = (c.hidden_size < 256) ? c.hidden_size : 256;
+            rmsnorm_f16<<<n_tokens, threads>>>(
+                m->buf_hidden, norm_weight, m->buf_norm,
+                c.hidden_size, n_tokens, c.rms_norm_eps);
+        }
+
+        snprintf(name_buf, sizeof(name_buf), "model.layers.%d.mlp.gate_proj.weight", layer);
+        __half* w_gate = get_weight(m, name_buf);
+        snprintf(name_buf, sizeof(name_buf), "model.layers.%d.mlp.up_proj.weight", layer);
+        __half* w_up = get_weight(m, name_buf);
+        if (!w_gate || !w_up) { model_set_error(m, "missing gate/up"); st = GOLLMGO_ERR_INVALID; goto prefill_cleanup; }
+
+        st = gemm_f16(m, m->buf_norm, w_gate, m->buf_gate, n_tokens, c.intermediate_size, c.hidden_size);
+        if (st != GOLLMGO_OK) goto prefill_cleanup;
+        st = gemm_f16(m, m->buf_norm, w_up, m->buf_up, n_tokens, c.intermediate_size, c.hidden_size);
+        if (st != GOLLMGO_OK) goto prefill_cleanup;
+
+        {
+            int total = n_tokens * c.intermediate_size;
+            silu_mul_f16<<<(total + 255) / 256, 256>>>(m->buf_gate, m->buf_up, m->buf_ffn, total);
+        }
+
+        snprintf(name_buf, sizeof(name_buf), "model.layers.%d.mlp.down_proj.weight", layer);
+        __half* w_down = get_weight(m, name_buf);
+        if (!w_down) { model_set_error(m, "missing down_proj"); st = GOLLMGO_ERR_INVALID; goto prefill_cleanup; }
+
+        st = gemm_f16(m, m->buf_ffn, w_down, m->buf_ffn_out, n_tokens, c.hidden_size, c.intermediate_size);
+        if (st != GOLLMGO_OK) goto prefill_cleanup;
+
+        {
+            int total = n_tokens * c.hidden_size;
+            residual_add_f16<<<(total + 255) / 256, 256>>>(
+                m->buf_hidden, m->buf_ffn_out, m->buf_hidden, total);
+        }
+    }
+
+    /* Final RMSNorm + LM head. */
+    {
+        int threads = (c.hidden_size < 256) ? c.hidden_size : 256;
+        rmsnorm_f16<<<n_tokens, threads>>>(
+            m->buf_hidden, get_weight(m, "model.norm.weight"), m->buf_norm,
+            c.hidden_size, n_tokens, c.rms_norm_eps);
+    }
+
+    st = gemm_f16(m, m->buf_norm, get_weight(m, "lm_head.weight"), m->buf_logits_f16,
+                   n_tokens, c.vocab_size, c.hidden_size);
+    if (st != GOLLMGO_OK) goto prefill_cleanup;
+
+    {
+        int total = n_tokens * c.vocab_size;
+        f16_to_f32<<<(total + 255) / 256, 256>>>(m->buf_logits_f16, m->buf_logits_f32, total);
+    }
+
+    st = model_check_cuda(m, cudaMemcpy(
+        host_logits_out, m->buf_logits_f32,
+        n_tokens * c.vocab_size * sizeof(float),
+        cudaMemcpyDeviceToHost));
+
+prefill_cleanup:
+    cudaFree(d_token_ids);
+    cudaFree(d_positions);
+    if (d_slot_mapping) cudaFree(d_slot_mapping);
+    return st;
+}
+
 gollmgo_status_t gollmgo_model_forward_paged(
     gollmgo_backend_t b,
     gollmgo_model_t m,
@@ -473,8 +670,7 @@ gollmgo_status_t gollmgo_model_forward_paged(
     const int32_t* host_positions,
     const int32_t* host_slot_mapping,
     int n_tokens,
-    void* k_cache_ptr,
-    void* v_cache_ptr,
+    gollmgo_kvcache_t kv_cache,
     const int32_t* host_seq_lens,
     const int32_t* host_slot_tables,
     int n_seqs,
@@ -482,14 +678,11 @@ gollmgo_status_t gollmgo_model_forward_paged(
     const int32_t* host_seq_token_counts,
     float* host_logits_out)
 {
-    if (!b || !m || !m->ready) return GOLLMGO_ERR_INVALID;
+    if (!b || !m || !m->ready || !kv_cache) return GOLLMGO_ERR_INVALID;
     if (n_tokens <= 0 || n_tokens > m->max_batch) {
         model_set_error(m, "n_tokens out of range");
         return GOLLMGO_ERR_INVALID;
     }
-
-    __half* k_cache = (__half*)k_cache_ptr;
-    __half* v_cache = (__half*)v_cache_ptr;
 
     auto& c = m->config;
     gollmgo_status_t st;
@@ -565,12 +758,14 @@ gollmgo_status_t gollmgo_model_forward_paged(
                 n_tokens, c.num_heads, c.num_kv_heads, c.head_dim, 10000.0f);
         }
 
-        /* ---- Paged KV cache write: store K/V for all tokens in this step ---- */
+        /* ---- Paged KV cache write: store K/V for this layer ---- */
+        __half* layer_k_cache = (__half*)gollmgo_kvcache_k_layer_ptr(kv_cache, layer);
+        __half* layer_v_cache = (__half*)gollmgo_kvcache_v_layer_ptr(kv_cache, layer);
         {
             int kv_size = c.num_kv_heads * c.head_dim;
             int threads = (kv_size < 256) ? kv_size : 256;
             paged_kv_write_f16<<<n_tokens, threads>>>(
-                k_cache, v_cache, m->buf_k, m->buf_v, d_slot_mapping,
+                layer_k_cache, layer_v_cache, m->buf_k, m->buf_v, d_slot_mapping,
                 n_tokens, c.num_kv_heads, c.head_dim);
         }
 
@@ -610,7 +805,7 @@ gollmgo_status_t gollmgo_model_forward_paged(
             int threads = (c.head_dim < 32) ? c.head_dim : 32;
             int smem = max_context_len * sizeof(float);
             paged_attention_v1_f16<<<grid, threads, smem>>>(
-                d_q_seqs, k_cache, v_cache, m->buf_attn_out,
+                d_q_seqs, layer_k_cache, layer_v_cache, m->buf_attn_out,
                 d_seq_lens, d_slot_tables,
                 n_seqs, c.num_heads, c.num_kv_heads, c.head_dim,
                 max_context_len, 1.0f / sqrtf((float)c.head_dim));

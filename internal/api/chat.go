@@ -141,14 +141,25 @@ func (s *Server) ChatCompletionsHandler() http.HandlerFunc {
 			maxTokens = 256
 		}
 
+		// Build prompt string and tokenize using the real tokenizer.
 		prompt := ""
 		for _, m := range req.Messages {
 			prompt += m.Content + " "
 		}
 
+		tokenIDs, err := s.tokenizer.Encode(prompt)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, APIError{Error: APIErrorBody{
+				Message: "tokenization failed: " + err.Error(),
+				Type:    "invalid_request_error",
+				Code:    "tokenization_error",
+			}})
+			return
+		}
+
 		engineReq := &engine.Request{
 			ID:        fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano()),
-			TokenIDs:  placeholderTokenize(prompt),
+			TokenIDs:  tokenIDs,
 			MaxTokens: maxTokens,
 		}
 
@@ -214,7 +225,7 @@ done:
 		Model:   req.Model,
 		Choices: []ChatCompletionChoice{{
 			Index:        0,
-			Message:      ChatMessage{Role: "assistant", Content: placeholderDetokenize(generated)},
+			Message:      ChatMessage{Role: "assistant", Content: s.detokenize(generated)},
 			FinishReason: "stop",
 		}},
 		Usage: UsageInfo{
@@ -266,7 +277,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request, req *ChatC
 			if tok.Err != nil {
 				goto done
 			}
-			content := placeholderDetokenize([]int32{tok.TokenID})
+			content := s.detokenize([]int32{tok.TokenID})
 			var finishReason *string
 			if tok.Finished {
 				s := "stop"
@@ -308,18 +319,10 @@ func writeSSE(w http.ResponseWriter, flusher http.Flusher, chunk StreamChunk) {
 	flusher.Flush()
 }
 
-func placeholderTokenize(text string) []int32 {
-	ids := make([]int32, len(text))
-	for i, b := range []byte(text) {
-		ids[i] = int32(b)
+func (s *Server) detokenize(ids []int32) string {
+	text, err := s.tokenizer.Decode(ids)
+	if err != nil {
+		return ""
 	}
-	return ids
-}
-
-func placeholderDetokenize(ids []int32) string {
-	bs := make([]byte, len(ids))
-	for i, id := range ids {
-		bs[i] = byte(id)
-	}
-	return string(bs)
+	return text
 }

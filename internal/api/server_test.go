@@ -12,14 +12,16 @@ import (
 
 	"github.com/TensorGreed/gollmgo/internal/config"
 	"github.com/TensorGreed/gollmgo/internal/engine"
+	"github.com/TensorGreed/gollmgo/internal/model"
 )
 
 func newTestServer(t *testing.T) (*Server, *engine.MockEngine) {
 	t.Helper()
 	eng := &engine.MockEngine{}
 	cfg := config.DefaultConfig()
+	tok := model.NewByteLevelTokenizer(256, 2)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return NewServer(cfg, eng, log), eng
+	return NewServer(cfg, eng, tok, log), eng
 }
 
 // --- Health endpoints ---

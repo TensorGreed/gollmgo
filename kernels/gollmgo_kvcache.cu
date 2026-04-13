@@ -9,42 +9,56 @@
 #include <cstdio>
 
 struct gollmgo_kvcache {
+    int num_layers;
     int num_slots;
     int num_kv_heads;
     int head_dim;
-    __half* k_cache;   /* [num_slots, num_kv_heads, head_dim] */
-    __half* v_cache;   /* [num_slots, num_kv_heads, head_dim] */
+    size_t layer_size;    /* num_slots * num_kv_heads * head_dim (in __half elements) */
+    __half* k_cache;      /* [num_layers, num_slots, num_kv_heads, head_dim] */
+    __half* v_cache;      /* [num_layers, num_slots, num_kv_heads, head_dim] */
 };
 
 extern "C" {
 
 gollmgo_status_t gollmgo_kvcache_create(gollmgo_backend_t b,
+                                         int num_layers,
                                          int num_slots,
                                          int num_kv_heads,
                                          int head_dim,
                                          gollmgo_kvcache_t* out) {
-    if (!b || !out || num_slots <= 0 || num_kv_heads <= 0 || head_dim <= 0)
+    if (!b || !out || num_layers <= 0 || num_slots <= 0 || num_kv_heads <= 0 || head_dim <= 0)
         return GOLLMGO_ERR_INVALID;
 
     gollmgo_kvcache_t c = new gollmgo_kvcache();
+    c->num_layers = num_layers;
     c->num_slots = num_slots;
     c->num_kv_heads = num_kv_heads;
     c->head_dim = head_dim;
+    c->layer_size = (size_t)num_slots * num_kv_heads * head_dim;
 
-    size_t cache_size = (size_t)num_slots * num_kv_heads * head_dim * sizeof(__half);
+    size_t total_size = (size_t)num_layers * c->layer_size * sizeof(__half);
 
-    cudaError_t err = cudaMalloc(&c->k_cache, cache_size);
+    cudaError_t err = cudaMalloc(&c->k_cache, total_size);
     if (err != cudaSuccess) { delete c; return GOLLMGO_ERR_OOM; }
 
-    err = cudaMalloc(&c->v_cache, cache_size);
+    err = cudaMalloc(&c->v_cache, total_size);
     if (err != cudaSuccess) { cudaFree(c->k_cache); delete c; return GOLLMGO_ERR_OOM; }
 
-    /* Zero-init the cache. */
-    cudaMemset(c->k_cache, 0, cache_size);
-    cudaMemset(c->v_cache, 0, cache_size);
+    cudaMemset(c->k_cache, 0, total_size);
+    cudaMemset(c->v_cache, 0, total_size);
 
     *out = c;
     return GOLLMGO_OK;
+}
+
+void* gollmgo_kvcache_k_layer_ptr(gollmgo_kvcache_t cache, int layer) {
+    if (!cache || layer < 0 || layer >= cache->num_layers) return nullptr;
+    return (void*)(cache->k_cache + layer * cache->layer_size);
+}
+
+void* gollmgo_kvcache_v_layer_ptr(gollmgo_kvcache_t cache, int layer) {
+    if (!cache || layer < 0 || layer >= cache->num_layers) return nullptr;
+    return (void*)(cache->v_cache + layer * cache->layer_size);
 }
 
 gollmgo_status_t gollmgo_kvcache_write(gollmgo_kvcache_t cache,
@@ -141,14 +155,6 @@ gollmgo_status_t gollmgo_kvcache_attention(gollmgo_kvcache_t cache,
     cudaFree(d_slot_tables);
 
     return GOLLMGO_OK;
-}
-
-void* gollmgo_kvcache_k_ptr(gollmgo_kvcache_t cache) {
-    return cache ? (void*)cache->k_cache : nullptr;
-}
-
-void* gollmgo_kvcache_v_ptr(gollmgo_kvcache_t cache) {
-    return cache ? (void*)cache->v_cache : nullptr;
 }
 
 gollmgo_status_t gollmgo_kvcache_destroy(gollmgo_kvcache_t cache) {

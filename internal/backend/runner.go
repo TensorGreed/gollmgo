@@ -32,6 +32,12 @@ type Batch struct {
 	SlotMapping []int32
 	// IsPrefill indicates whether each sequence is in prefill mode.
 	IsPrefill []bool
+	// SeqTokenCounts[i] = number of tokens in this batch for sequence i.
+	SeqTokenCounts []int32
+	// SeqContextLens[i] = total cached KV length for sequence i (including this batch).
+	SeqContextLens []int32
+	// SeqSlotTables[i] = full slot table for sequence i (len = SeqContextLens[i]).
+	SeqSlotTables [][]int32
 }
 
 // StepOutput holds the result of one backend step.

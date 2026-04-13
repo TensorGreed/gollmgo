@@ -108,6 +108,44 @@ func (m *CUDAModel) Forward(_ context.Context, tokenIDs []int32, positions []int
 	return logits, nil
 }
 
+// ForwardPrefill runs eager attention and writes K/V to the paged cache.
+// Used for prefill steps so that subsequent decode steps can read from the cache.
+func (m *CUDAModel) ForwardPrefill(
+	_ context.Context,
+	tokenIDs, positions, slotMapping []int32,
+	kvCache *CUDAKVCache,
+) ([]float32, error) {
+	n := len(tokenIDs)
+	if n == 0 {
+		return nil, fmt.Errorf("cuda: empty token input")
+	}
+
+	vocabSize := m.config.VocabSize
+	logits := make([]float32, n*vocabSize)
+
+	var cacheHandle C.gollmgo_kvcache_t
+	var slotPtr *C.int32_t
+	if kvCache != nil && len(slotMapping) > 0 {
+		cacheHandle = kvCache.handle
+		slotPtr = (*C.int32_t)(unsafe.Pointer(&slotMapping[0]))
+	}
+
+	status := C.gollmgo_model_forward_prefill(
+		m.backend,
+		m.handle,
+		(*C.int32_t)(unsafe.Pointer(&tokenIDs[0])),
+		(*C.int32_t)(unsafe.Pointer(&positions[0])),
+		slotPtr,
+		C.int(n),
+		cacheHandle,
+		(*C.float)(unsafe.Pointer(&logits[0])),
+	)
+	if status != C.GOLLMGO_OK {
+		return nil, fmt.Errorf("cuda: forward_prefill failed (status %d)", int(status))
+	}
+	return logits, nil
+}
+
 // ForwardPaged runs one forward pass with paged KV cache.
 func (m *CUDAModel) ForwardPaged(
 	_ context.Context,
@@ -132,8 +170,7 @@ func (m *CUDAModel) ForwardPaged(
 		(*C.int32_t)(unsafe.Pointer(&positions[0])),
 		(*C.int32_t)(unsafe.Pointer(&slotMapping[0])),
 		C.int(nTokens),
-		unsafe.Pointer(kvCache.KCacheDevPtr()),
-		unsafe.Pointer(kvCache.VCacheDevPtr()),
+		kvCache.handle,
 		(*C.int32_t)(unsafe.Pointer(&seqLens[0])),
 		(*C.int32_t)(unsafe.Pointer(&slotTables[0])),
 		C.int(nSeqs),
@@ -163,11 +200,6 @@ type CUDARunnerWithModel struct {
 	*CUDARunner
 	Model   *CUDAModel
 	KVCache *CUDAKVCache
-	// SeqSlotTables is populated by the Go-side engine for each step.
-	// Maps seqID -> full slot table for that sequence.
-	SeqSlotTables map[uint64][]int32
-	// SeqContextLens maps seqID -> total cached KV length.
-	SeqContextLens map[uint64]int32
 }
 
 // Step executes a forward pass using the loaded model.
@@ -181,12 +213,51 @@ func (r *CUDARunnerWithModel) Step(ctx context.Context, batch *backend.Batch) (*
 	nSeq := len(batch.SequenceIDs)
 	vocabSize := r.Model.config.VocabSize
 
-	// Use paged forward when slot mappings and KV cache are available.
-	if len(batch.SlotMapping) > 0 && r.KVCache != nil {
+	// Check if any sequence is in prefill mode.
+	hasPrefill := false
+	for _, p := range batch.IsPrefill {
+		if p {
+			hasPrefill = true
+			break
+		}
+	}
+
+	if hasPrefill {
+		// Prefill: eager attention + KV cache write.
+		return r.stepPrefill(ctx, batch, nSeq, vocabSize)
+	}
+
+	// Decode-only: paged attention reading from KV cache.
+	if r.KVCache != nil && len(batch.SlotMapping) > 0 {
 		return r.stepPaged(ctx, batch, nSeq, vocabSize)
 	}
 
+	// Fallback: eager (no KV cache).
 	return r.stepEager(ctx, batch, nSeq, vocabSize)
+}
+
+func (r *CUDARunnerWithModel) stepPrefill(ctx context.Context, batch *backend.Batch, nSeq, vocabSize int) (*backend.StepOutput, error) {
+	logits, err := r.Model.ForwardPrefill(ctx, batch.TokenIDs, batch.Positions, batch.SlotMapping, r.KVCache)
+	if err != nil {
+		return nil, err
+	}
+
+	// Return logits for the last token of each sequence (prefill).
+	out := &backend.StepOutput{Logits: make([][]float32, nSeq)}
+	totalTokens := len(batch.TokenIDs)
+	for i := 0; i < nSeq; i++ {
+		tokenIdx := totalTokens - nSeq + i
+		if tokenIdx < 0 {
+			tokenIdx = i
+		}
+		start := tokenIdx * vocabSize
+		end := start + vocabSize
+		if end > len(logits) {
+			return nil, fmt.Errorf("cuda: logits index out of range")
+		}
+		out.Logits[i] = logits[start:end]
+	}
+	return out, nil
 }
 
 func (r *CUDARunnerWithModel) stepEager(ctx context.Context, batch *backend.Batch, nSeq, vocabSize int) (*backend.StepOutput, error) {
@@ -213,51 +284,11 @@ func (r *CUDARunnerWithModel) stepEager(ctx context.Context, batch *backend.Batc
 }
 
 func (r *CUDARunnerWithModel) stepPaged(ctx context.Context, batch *backend.Batch, nSeq, vocabSize int) (*backend.StepOutput, error) {
-	// Build per-sequence metadata for the paged forward C API.
-	seqTokenCounts := make([]int32, nSeq)
-	seqLens := make([]int32, nSeq)
+	// Use per-sequence metadata from the batch (populated by ServingEngine).
+	seqLens := batch.SeqContextLens
+	seqTokenCounts := batch.SeqTokenCounts
 
-	// Count tokens per sequence in the batch.
-	// Tokens are ordered per-sequence: all tokens of seq 0, then seq 1, etc.
-	tokenOffset := 0
-	for i, sid := range batch.SequenceIDs {
-		if batch.IsPrefill[i] {
-			// Prefill: prompt tokens are in the batch.
-			count := 0
-			for j := tokenOffset; j < len(batch.TokenIDs); j++ {
-				if j < len(batch.Positions) && (i+1 >= nSeq || j < tokenOffset+int(batch.Positions[tokenOffset])+100) {
-					count++
-				} else {
-					break
-				}
-			}
-			// Simpler: scan positions to find boundary.
-			count = 0
-			for j := tokenOffset; j < len(batch.TokenIDs); j++ {
-				count++
-				if j+1 >= len(batch.TokenIDs) {
-					break
-				}
-				// Next token has a lower position -> new sequence.
-				if j+1 < len(batch.Positions) && batch.Positions[j+1] <= batch.Positions[j] && j+1-tokenOffset > 0 {
-					break
-				}
-			}
-			seqTokenCounts[i] = int32(count)
-			tokenOffset += count
-		} else {
-			// Decode: exactly 1 token.
-			seqTokenCounts[i] = 1
-			tokenOffset++
-		}
-
-		// Context length: look up from engine-provided map, or infer.
-		if r.SeqContextLens != nil {
-			seqLens[i] = r.SeqContextLens[sid]
-		}
-	}
-
-	// Build flattened slot tables.
+	// Flatten per-sequence slot tables into a padded 2D array.
 	maxContextLen := int32(0)
 	for _, l := range seqLens {
 		if l > maxContextLen {
@@ -269,12 +300,10 @@ func (r *CUDARunnerWithModel) stepPaged(ctx context.Context, batch *backend.Batc
 	}
 
 	slotTables := make([]int32, nSeq*int(maxContextLen))
-	if r.SeqSlotTables != nil {
-		for i, sid := range batch.SequenceIDs {
-			table := r.SeqSlotTables[sid]
-			for j := 0; j < len(table) && j < int(maxContextLen); j++ {
-				slotTables[i*int(maxContextLen)+j] = table[j]
-			}
+	for i := 0; i < nSeq && i < len(batch.SeqSlotTables); i++ {
+		table := batch.SeqSlotTables[i]
+		for j := 0; j < len(table) && j < int(maxContextLen); j++ {
+			slotTables[i*int(maxContextLen)+j] = table[j]
 		}
 	}
 
@@ -290,7 +319,6 @@ func (r *CUDARunnerWithModel) stepPaged(ctx context.Context, batch *backend.Batc
 		return nil, err
 	}
 
-	// Paged forward returns [nSeq * vocabSize] logits (one per sequence).
 	out := &backend.StepOutput{Logits: make([][]float32, nSeq)}
 	for i := 0; i < nSeq; i++ {
 		start := i * vocabSize

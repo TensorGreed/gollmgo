@@ -104,20 +104,50 @@ func LoadHFTokenizer(path string, eosToken, bosToken string) (*HFTokenizer, erro
 	}, nil
 }
 
+// byteToUnicode builds the GPT-2 / LLaMA byte-level BPE mapping.
+// Bytes that are printable ASCII or Latin-1 supplement map to themselves.
+// Other bytes map to U+0100 and up.
+func byteToUnicode() [256]rune {
+	var table [256]rune
+	n := rune(0)
+	for b := 0; b < 256; b++ {
+		if (b >= 0x21 && b <= 0x7E) || (b >= 0xA1 && b <= 0xAC) || (b >= 0xAE && b <= 0xFF) {
+			table[b] = rune(b)
+		} else {
+			table[b] = 256 + n
+			n++
+		}
+	}
+	return table
+}
+
+var b2u = byteToUnicode()
+
+// unicodeToByte is the reverse of byteToUnicode.
+func unicodeToByte() map[rune]byte {
+	m := make(map[rune]byte, 256)
+	for b := 0; b < 256; b++ {
+		m[b2u[b]] = byte(b)
+	}
+	return m
+}
+
+var u2b = unicodeToByte()
+
 // Encode tokenizes text using BPE.
 func (t *HFTokenizer) Encode(text string) ([]int32, error) {
 	if text == "" {
 		return nil, nil
 	}
 
-	// Start with individual bytes/characters as tokens.
-	// HF BPE typically uses byte-level encoding where each byte is a token.
-	tokens := make([]string, 0, len(text))
-	for _, b := range []byte(text) {
-		// HF byte-level BPE uses a specific byte-to-unicode mapping.
-		// For now, use the raw byte representation.
-		tok := string([]byte{b})
-		tokens = append(tokens, tok)
+	// SentencePiece-style normalization:
+	// 1. Prepend ▁ to the entire input (word-initial marker).
+	// 2. Replace all spaces with ▁.
+	normalized := "▁" + strings.ReplaceAll(text, " ", "▁")
+
+	tokens := make([]string, 0, len(normalized))
+	for _, r := range normalized {
+		tokens = append(tokens, string(r))
 	}
 
 	// Build merge priority index.
@@ -185,7 +215,33 @@ func (t *HFTokenizer) Decode(ids []int32) (string, error) {
 		}
 		sb.WriteString(t.invVocab[id])
 	}
-	return sb.String(), nil
+	// Post-process: ▁ represents space, <0xNN> represents raw bytes.
+	raw := sb.String()
+
+	// Replace byte tokens <0xNN> with actual bytes.
+	var out strings.Builder
+	i := 0
+	for i < len(raw) {
+		if i+6 <= len(raw) && raw[i] == '<' && raw[i+1] == '0' && raw[i+2] == 'x' && raw[i+5] == '>' {
+			hex := raw[i+3 : i+5]
+			var b byte
+			fmt.Sscanf(hex, "%02X", &b)
+			out.WriteByte(b)
+			i += 6
+		} else {
+			out.WriteByte(raw[i])
+			i++
+		}
+	}
+	result := out.String()
+
+	// SentencePiece: ▁ represents space.
+	result = strings.ReplaceAll(result, "▁", " ")
+	// Trim leading space (SentencePiece artifact).
+	if len(result) > 0 && result[0] == ' ' {
+		result = result[1:]
+	}
+	return result, nil
 }
 
 func (t *HFTokenizer) VocabSize() int   { return t.vocabSize }
