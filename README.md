@@ -32,6 +32,9 @@ Each component owns its boundary. The scheduler owns sequence state. The KV cach
 ### Build
 
 ```bash
+# If go is not in PATH, set it:
+# export GO=/path/to/go  OR  export PATH=/path/to/go/bin:$PATH
+
 make kernels   # compile CUDA kernels → static libs
 make build     # go build with CGO_ENABLED=1 -tags gpu
 ```

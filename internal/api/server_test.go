@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -194,6 +195,85 @@ func TestChatCompletionsStreaming(t *testing.T) {
 	}
 	if !strings.Contains(respBody, "data: [DONE]") {
 		t.Fatal("expected [DONE] sentinel")
+	}
+}
+
+// --- API behavior on channel close without Finished token ---
+
+func TestChatCompletionsChannelCloseNonStreaming(t *testing.T) {
+	s, eng := newTestServer(t)
+
+	body := `{"model":"test","messages":[{"role":"user","content":"hello"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	// Close the channel without sending a Finished token (simulates engine shutdown).
+	go func() {
+		for len(eng.PendingRequestIDs()) == 0 {
+		}
+		ids := eng.PendingRequestIDs()
+		// Send one token, then close without Finished.
+		eng.PushResultsTo(ids[0], []engine.TokenResult{
+			{SequenceID: 1, TokenID: 72, Finished: false},
+		})
+		// Force close the channel by stopping the engine.
+		eng.Stop()
+	}()
+
+	s.Handler().ServeHTTP(rec, req)
+
+	// Should NOT be 200. The channel was closed without a Finished token.
+	if rec.Code == 200 {
+		t.Fatal("expected non-200 status on engine shutdown, got 200")
+	}
+}
+
+func TestChatCompletionsChannelCloseStreaming(t *testing.T) {
+	s, eng := newTestServer(t)
+
+	body := `{"model":"test","messages":[{"role":"user","content":"hello"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	go func() {
+		for len(eng.PendingRequestIDs()) == 0 {
+		}
+		ids := eng.PendingRequestIDs()
+		eng.PushResultsTo(ids[0], []engine.TokenResult{
+			{SequenceID: 1, TokenID: 65, Finished: false},
+		})
+		eng.Stop()
+	}()
+
+	s.Handler().ServeHTTP(rec, req)
+
+	respBody := rec.Body.String()
+	// Should contain an error indication before [DONE].
+	if !strings.Contains(respBody, "error") {
+		t.Fatal("expected error indication in streaming response on shutdown")
+	}
+}
+
+func TestChatCompletionsTokenError(t *testing.T) {
+	s, eng := newTestServer(t)
+
+	body := `{"model":"test","messages":[{"role":"user","content":"hello"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	go func() {
+		for len(eng.PendingRequestIDs()) == 0 {
+		}
+		ids := eng.PendingRequestIDs()
+		eng.PushResultsTo(ids[0], []engine.TokenResult{
+			{SequenceID: 1, Finished: true, Err: fmt.Errorf("GPU OOM")},
+		})
+	}()
+
+	s.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != 500 {
+		t.Fatalf("expected 500 on token error, got %d", rec.Code)
 	}
 }
 

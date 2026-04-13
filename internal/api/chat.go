@@ -200,7 +200,12 @@ func (s *Server) handleNonStream(w http.ResponseWriter, r *http.Request, req *Ch
 		case tok, ok := <-handle.Tokens:
 			if !ok {
 				// Channel closed without a Finished token — engine shutdown.
-				goto done
+				writeJSON(w, http.StatusServiceUnavailable, APIError{Error: APIErrorBody{
+					Message: "engine shut down before request completed",
+					Type:    "server_error",
+					Code:    "engine_shutdown",
+				}})
+				return
 			}
 			if tok.Err != nil {
 				writeJSON(w, http.StatusInternalServerError, APIError{Error: APIErrorBody{
@@ -272,9 +277,26 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request, req *ChatC
 			goto done
 		case tok, ok := <-handle.Tokens:
 			if !ok {
+				// Channel closed — send an error chunk before [DONE].
+				writeSSE(w, flusher, StreamChunk{
+					ID: engineReq.ID, Object: "chat.completion.chunk",
+					Created: time.Now().Unix(), Model: req.Model,
+					Choices: []StreamChunkChoice{{
+						Index: 0,
+						Delta: StreamChunkDelta{Content: "\n[error: engine shut down]"},
+					}},
+				})
 				goto done
 			}
 			if tok.Err != nil {
+				writeSSE(w, flusher, StreamChunk{
+					ID: engineReq.ID, Object: "chat.completion.chunk",
+					Created: time.Now().Unix(), Model: req.Model,
+					Choices: []StreamChunkChoice{{
+						Index: 0,
+						Delta: StreamChunkDelta{Content: "\n[error: " + tok.Err.Error() + "]"},
+					}},
+				})
 				goto done
 			}
 			content := s.detokenize([]int32{tok.TokenID})

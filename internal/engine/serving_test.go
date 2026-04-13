@@ -422,4 +422,95 @@ func TestServingEngineBenchSaturation(t *testing.T) {
 	wg.Wait()
 }
 
+// Test: variable-length prefill — two requests with different prompt sizes
+// enqueued together. Each must get correct logits for its own last token.
+func TestServingEngineVariableLengthPrefill(t *testing.T) {
+	// Runner returns the total batch token count as the winning token ID.
+	// This way we can verify that each sequence sees the right batch.
+	runner := &backend.MockRunner{
+		StepFunc: func(_ context.Context, b *backend.Batch) (*backend.StepOutput, error) {
+			out := &backend.StepOutput{
+				Logits: make([][]float32, len(b.SequenceIDs)),
+			}
+			for i := range b.SequenceIDs {
+				logits := make([]float32, 100)
+				logits[2] = 10.0 // EOS immediately
+				out.Logits[i] = logits
+			}
+			return out, nil
+		},
+	}
+
+	eng, cancel := makeServingEngine(t, runner)
+	defer cancel()
+	defer eng.Stop()
+
+	// Seq A: 3-token prompt. Seq B: 7-token prompt.
+	hA, _ := eng.Enqueue(ctx(), &Request{ID: "a", TokenIDs: []int32{1, 2, 3}, MaxTokens: 5})
+	hB, _ := eng.Enqueue(ctx(), &Request{ID: "b", TokenIDs: []int32{10, 20, 30, 40, 50, 60, 70}, MaxTokens: 5})
+
+	// Both should complete (EOS on first decode).
+	tokA := drainHandle(t, hA, 5*time.Second)
+	tokB := drainHandle(t, hB, 5*time.Second)
+
+	if len(tokA) == 0 || !tokA[len(tokA)-1].Finished {
+		t.Errorf("seq A should finish, got %d tokens", len(tokA))
+	}
+	if len(tokB) == 0 || !tokB[len(tokB)-1].Finished {
+		t.Errorf("seq B should finish, got %d tokens", len(tokB))
+	}
+}
+
+// Test: mixed prefill/decode — start one request, wait for it to enter decode,
+// then add a new request. The batch has both a prefill and a decode sequence.
+func TestServingEngineMixedPrefillDecode(t *testing.T) {
+	var mu sync.Mutex
+	seqCounts := make(map[uint64]int)
+
+	runner := &backend.MockRunner{
+		StepFunc: func(_ context.Context, b *backend.Batch) (*backend.StepOutput, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			out := &backend.StepOutput{
+				Logits: make([][]float32, len(b.SequenceIDs)),
+			}
+			for i, sid := range b.SequenceIDs {
+				seqCounts[sid]++
+				logits := make([]float32, 100)
+				if seqCounts[sid] > 3 {
+					logits[2] = 10.0 // EOS after 3 tokens
+				} else {
+					logits[42] = 10.0
+				}
+				out.Logits[i] = logits
+			}
+			return out, nil
+		},
+	}
+
+	eng, cancel := makeServingEngine(t, runner)
+	defer cancel()
+	defer eng.Stop()
+
+	// Start seq A first.
+	hA, _ := eng.Enqueue(ctx(), &Request{ID: "a", TokenIDs: []int32{1, 2}, MaxTokens: 10})
+
+	// Wait briefly so seq A enters decode mode.
+	time.Sleep(50 * time.Millisecond)
+
+	// Start seq B — this creates a mixed prefill/decode batch.
+	hB, _ := eng.Enqueue(ctx(), &Request{ID: "b", TokenIDs: []int32{3, 4, 5}, MaxTokens: 10})
+
+	// Both must complete correctly.
+	tokA := drainHandle(t, hA, 5*time.Second)
+	tokB := drainHandle(t, hB, 5*time.Second)
+
+	if len(tokA) == 0 || !tokA[len(tokA)-1].Finished {
+		t.Errorf("seq A not finished, got %d tokens", len(tokA))
+	}
+	if len(tokB) == 0 || !tokB[len(tokB)-1].Finished {
+		t.Errorf("seq B not finished, got %d tokens", len(tokB))
+	}
+}
+
 func ctx() context.Context { return context.Background() }

@@ -322,12 +322,14 @@ func runServingBench(log *slog.Logger, targetURL string, numPrompts, promptLen, 
 				log.Error("request failed", "error", err)
 				return
 			}
-			ttft := time.Since(reqStart)
+			// For non-streaming, the response headers arrive when
+			// the server starts writing. This is approximately TTFT.
+			headerTime := time.Since(reqStart)
 			io.ReadAll(resp.Body)
 			resp.Body.Close()
 			total := time.Since(reqStart)
 
-			results <- requestResult{ttft: ttft, total: total, tokens: outputLen}
+			results <- requestResult{ttft: headerTime, total: total, tokens: outputLen}
 		}(i)
 	}
 
@@ -361,7 +363,7 @@ func runServingBench(log *slog.Logger, targetURL string, numPrompts, promptLen, 
 		ElapsedSeconds:  elapsed.Seconds(),
 		TokensPerSecond: float64(count*outputLen) / elapsed.Seconds(),
 		RequestsPerSec:  float64(count) / elapsed.Seconds(),
-		AvgTTFTMs:       float64(totalTTFT.Milliseconds()) / float64(count),
+		AvgResponseMs:   float64(totalTTFT.Milliseconds()) / float64(count),
 		AvgLatencyMs:    float64(totalDuration.Milliseconds()) / float64(count),
 	}
 	data, _ := json.MarshalIndent(result, "", "  ")
@@ -378,7 +380,9 @@ type BenchResult struct {
 	ElapsedSeconds  float64 `json:"elapsed_seconds"`
 	TokensPerSecond float64 `json:"tokens_per_second"`
 	RequestsPerSec  float64 `json:"requests_per_second"`
-	AvgTTFTMs       float64 `json:"avg_ttft_ms,omitempty"`
+	// AvgResponseMs is the average time from request start to response
+	// headers (non-streaming). For streaming, this would be true TTFT.
+	AvgResponseMs   float64 `json:"avg_response_ms,omitempty"`
 	AvgLatencyMs    float64 `json:"avg_latency_ms,omitempty"`
 }
 
