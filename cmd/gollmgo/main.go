@@ -49,6 +49,9 @@ func cmdServe(args []string) {
 	host := fs.String("host", "", "bind host (overrides config)")
 	port := fs.Int("port", 0, "bind port (overrides config)")
 	logLevel := fs.String("log-level", "", "log level: debug, info, warn, error")
+	modelPath := fs.String("model", "", "path to model file (.safetensors)")
+	tokenizerPath := fs.String("tokenizer", "", "path to tokenizer.json (default: auto-detect)")
+	deviceID := fs.Int("device", 0, "CUDA device ID")
 	fs.Parse(args)
 
 	// Load config.
@@ -72,23 +75,37 @@ func cmdServe(args []string) {
 	if *logLevel != "" {
 		cfg.LogLevel = *logLevel
 	}
+	if *modelPath != "" {
+		cfg.ModelPath = *modelPath
+	}
+	if *tokenizerPath != "" {
+		cfg.TokenizerPath = *tokenizerPath
+	}
 
 	if err := cfg.Validate(); err != nil {
 		fmt.Fprintf(os.Stderr, "config error: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Setup logger.
 	log := newLogger(cfg.LogLevel)
 
-	// Create mock components (real GPU components created when model path provided).
+	// Initialize runner and tokenizer.
 	var runner backend.Runner
 	var tokenizer model.Tokenizer
 
-	// For now, use mock runner for development.
-	// GPU runner is created via: internal/backend/cuda.New() when -tags gpu is set.
-	runner = &backend.MockRunner{}
-	tokenizer = model.NewByteLevelTokenizer(32000, 2)
+	if cfg.ModelPath != "" {
+		var err error
+		runner, tokenizer, err = initGPURunner(log, cfg.ModelPath, cfg.TokenizerPath, *deviceID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "GPU init failed: %v\n", err)
+			os.Exit(1)
+		}
+		log.Info("GPU model loaded", "model", cfg.ModelPath)
+	} else {
+		log.Info("no --model provided, using mock runner (development mode)")
+		runner = &backend.MockRunner{}
+		tokenizer = model.NewByteLevelTokenizer(32000, 2)
+	}
 
 	log.Info("starting gollmgo",
 		"host", cfg.Host,

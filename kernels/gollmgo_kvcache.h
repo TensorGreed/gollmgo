@@ -54,6 +54,10 @@ gollmgo_status_t gollmgo_kvcache_attention(gollmgo_kvcache_t cache,
                                             int max_seq_len,
                                             float scale);
 
+/* Get device pointers to K and V cache arrays (for paged forward pass). */
+void* gollmgo_kvcache_k_ptr(gollmgo_kvcache_t cache);
+void* gollmgo_kvcache_v_ptr(gollmgo_kvcache_t cache);
+
 /* Destroy the KV cache and free GPU memory. */
 gollmgo_status_t gollmgo_kvcache_destroy(gollmgo_kvcache_t cache);
 

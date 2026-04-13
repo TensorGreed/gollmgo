@@ -85,6 +85,16 @@ func (c *CUDAKVCache) Attention(q []uint16, seqLens, slotTables []int32,
 	return out, nil
 }
 
+// KCacheDevPtr returns the device pointer to the K cache.
+func (c *CUDAKVCache) KCacheDevPtr() unsafe.Pointer {
+	return C.gollmgo_kvcache_k_ptr(c.handle)
+}
+
+// VCacheDevPtr returns the device pointer to the V cache.
+func (c *CUDAKVCache) VCacheDevPtr() unsafe.Pointer {
+	return C.gollmgo_kvcache_v_ptr(c.handle)
+}
+
 // Close destroys the KV cache.
 func (c *CUDAKVCache) Close() error {
 	if c.handle != nil {

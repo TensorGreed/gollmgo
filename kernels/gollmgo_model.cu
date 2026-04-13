@@ -10,6 +10,7 @@
 
 #include "gollmgo_model.h"
 #include "gollmgo_ops.cuh"
+#include "gollmgo_paged_attn.cuh"
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -462,6 +463,306 @@ gollmgo_status_t gollmgo_model_forward(gollmgo_backend_t b,
 
     cudaFree(d_token_ids);
     cudaFree(d_positions);
+    return st;
+}
+
+gollmgo_status_t gollmgo_model_forward_paged(
+    gollmgo_backend_t b,
+    gollmgo_model_t m,
+    const int32_t* host_token_ids,
+    const int32_t* host_positions,
+    const int32_t* host_slot_mapping,
+    int n_tokens,
+    void* k_cache_ptr,
+    void* v_cache_ptr,
+    const int32_t* host_seq_lens,
+    const int32_t* host_slot_tables,
+    int n_seqs,
+    int max_context_len,
+    const int32_t* host_seq_token_counts,
+    float* host_logits_out)
+{
+    if (!b || !m || !m->ready) return GOLLMGO_ERR_INVALID;
+    if (n_tokens <= 0 || n_tokens > m->max_batch) {
+        model_set_error(m, "n_tokens out of range");
+        return GOLLMGO_ERR_INVALID;
+    }
+
+    __half* k_cache = (__half*)k_cache_ptr;
+    __half* v_cache = (__half*)v_cache_ptr;
+
+    auto& c = m->config;
+    gollmgo_status_t st;
+
+    /* Copy inputs to device. */
+    int32_t *d_token_ids = nullptr, *d_positions = nullptr, *d_slot_mapping = nullptr;
+    int32_t *d_seq_lens = nullptr, *d_slot_tables = nullptr;
+
+    st = model_check_cuda(m, cudaMalloc((void**)&d_token_ids, n_tokens * sizeof(int32_t)));
+    if (st != GOLLMGO_OK) return st;
+    st = model_check_cuda(m, cudaMalloc((void**)&d_positions, n_tokens * sizeof(int32_t)));
+    if (st != GOLLMGO_OK) goto cleanup;
+    st = model_check_cuda(m, cudaMalloc((void**)&d_slot_mapping, n_tokens * sizeof(int32_t)));
+    if (st != GOLLMGO_OK) goto cleanup;
+    st = model_check_cuda(m, cudaMalloc((void**)&d_seq_lens, n_seqs * sizeof(int32_t)));
+    if (st != GOLLMGO_OK) goto cleanup;
+    st = model_check_cuda(m, cudaMalloc((void**)&d_slot_tables, (size_t)n_seqs * max_context_len * sizeof(int32_t)));
+    if (st != GOLLMGO_OK) goto cleanup;
+
+    cudaMemcpy(d_token_ids, host_token_ids, n_tokens * sizeof(int32_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_positions, host_positions, n_tokens * sizeof(int32_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_slot_mapping, host_slot_mapping, n_tokens * sizeof(int32_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_seq_lens, host_seq_lens, n_seqs * sizeof(int32_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_slot_tables, host_slot_tables, (size_t)n_seqs * max_context_len * sizeof(int32_t), cudaMemcpyHostToDevice);
+
+    /* ---- Embedding ---- */
+    {
+        int threads = (c.hidden_size < 256) ? c.hidden_size : 256;
+        dim3 grid(n_tokens, (c.hidden_size + threads - 1) / threads);
+        embedding_lookup_f16<<<grid, threads>>>(
+            get_weight(m, "model.embed_tokens.weight"),
+            d_token_ids, m->buf_hidden, c.hidden_size, c.vocab_size);
+    }
+
+    /* ---- Transformer layers ---- */
+    for (int layer = 0; layer < c.num_layers; layer++) {
+        char name_buf[256];
+
+        /* RMSNorm (input_layernorm). */
+        snprintf(name_buf, sizeof(name_buf), "model.layers.%d.input_layernorm.weight", layer);
+        __half* norm_weight = get_weight(m, name_buf);
+        if (!norm_weight) { model_set_error(m, name_buf); st = GOLLMGO_ERR_INVALID; goto cleanup; }
+
+        {
+            int threads = (c.hidden_size < 256) ? c.hidden_size : 256;
+            rmsnorm_f16<<<n_tokens, threads>>>(
+                m->buf_hidden, norm_weight, m->buf_norm,
+                c.hidden_size, n_tokens, c.rms_norm_eps);
+        }
+
+        /* QKV projections. */
+        snprintf(name_buf, sizeof(name_buf), "model.layers.%d.self_attn.q_proj.weight", layer);
+        __half* wq = get_weight(m, name_buf);
+        snprintf(name_buf, sizeof(name_buf), "model.layers.%d.self_attn.k_proj.weight", layer);
+        __half* wk = get_weight(m, name_buf);
+        snprintf(name_buf, sizeof(name_buf), "model.layers.%d.self_attn.v_proj.weight", layer);
+        __half* wv = get_weight(m, name_buf);
+        if (!wq || !wk || !wv) { model_set_error(m, "missing QKV weights"); st = GOLLMGO_ERR_INVALID; goto cleanup; }
+
+        st = gemm_f16(m, m->buf_norm, wq, m->buf_q, n_tokens, c.num_heads * c.head_dim, c.hidden_size);
+        if (st != GOLLMGO_OK) goto cleanup;
+        st = gemm_f16(m, m->buf_norm, wk, m->buf_k, n_tokens, c.num_kv_heads * c.head_dim, c.hidden_size);
+        if (st != GOLLMGO_OK) goto cleanup;
+        st = gemm_f16(m, m->buf_norm, wv, m->buf_v, n_tokens, c.num_kv_heads * c.head_dim, c.hidden_size);
+        if (st != GOLLMGO_OK) goto cleanup;
+
+        /* RoPE. */
+        {
+            int max_heads = (c.num_heads > c.num_kv_heads) ? c.num_heads : c.num_kv_heads;
+            dim3 grid(n_tokens, max_heads);
+            rope_f16<<<grid, c.head_dim / 2>>>(
+                m->buf_q, m->buf_k, d_positions,
+                n_tokens, c.num_heads, c.num_kv_heads, c.head_dim, 10000.0f);
+        }
+
+        /* ---- Paged KV cache write: store K/V for all tokens in this step ---- */
+        {
+            int kv_size = c.num_kv_heads * c.head_dim;
+            int threads = (kv_size < 256) ? kv_size : 256;
+            paged_kv_write_f16<<<n_tokens, threads>>>(
+                k_cache, v_cache, m->buf_k, m->buf_v, d_slot_mapping,
+                n_tokens, c.num_kv_heads, c.head_dim);
+        }
+
+        /* ---- Paged Attention v1: read from cache for all sequences ----
+         * For each sequence we need to attend over all its cached KV tokens.
+         * We produce one output per sequence (the last token's attention output).
+         *
+         * For simplicity, we run paged attention for each of the n_seqs
+         * sequences using the last token's Q vector. We need to extract
+         * the last Q for each sequence.
+         *
+         * The query for sequence i is at the position of its last token
+         * in the flattened batch. We use seq_token_counts to find these offsets.
+         */
+        {
+            /* Build per-sequence Q pointers on host, copy to device.
+             * For n_seqs decode queries, we extract the last Q per sequence. */
+            int q_head_size = c.num_heads * c.head_dim;
+            __half* d_q_seqs = nullptr;
+            cudaMalloc((void**)&d_q_seqs, n_seqs * q_head_size * sizeof(__half));
+
+            /* Compute offsets: seq i's last token is at sum(seq_token_counts[0..i])-1 */
+            int offset = 0;
+            for (int s = 0; s < n_seqs; s++) {
+                int count = host_seq_token_counts[s];
+                int last_idx = offset + count - 1;
+                cudaMemcpy(
+                    d_q_seqs + s * q_head_size,
+                    m->buf_q + last_idx * q_head_size,
+                    q_head_size * sizeof(__half),
+                    cudaMemcpyDeviceToDevice);
+                offset += count;
+            }
+
+            /* Run paged attention. */
+            dim3 grid(n_seqs, c.num_heads);
+            int threads = (c.head_dim < 32) ? c.head_dim : 32;
+            int smem = max_context_len * sizeof(float);
+            paged_attention_v1_f16<<<grid, threads, smem>>>(
+                d_q_seqs, k_cache, v_cache, m->buf_attn_out,
+                d_seq_lens, d_slot_tables,
+                n_seqs, c.num_heads, c.num_kv_heads, c.head_dim,
+                max_context_len, 1.0f / sqrtf((float)c.head_dim));
+
+            cudaFree(d_q_seqs);
+        }
+
+        /* Output projection on per-sequence attention outputs. */
+        snprintf(name_buf, sizeof(name_buf), "model.layers.%d.self_attn.o_proj.weight", layer);
+        __half* wo = get_weight(m, name_buf);
+        if (!wo) { model_set_error(m, "missing o_proj weight"); st = GOLLMGO_ERR_INVALID; goto cleanup; }
+
+        st = gemm_f16(m, m->buf_attn_out, wo, m->buf_proj,
+                       n_seqs, c.hidden_size, c.num_heads * c.head_dim);
+        if (st != GOLLMGO_OK) goto cleanup;
+
+        /* Residual add — apply only to the last token of each sequence.
+         * For simplicity (and correctness at this stage), we apply to
+         * the buf_hidden at each sequence's last-token position. */
+        {
+            int offset = 0;
+            for (int s = 0; s < n_seqs; s++) {
+                int count = host_seq_token_counts[s];
+                int last_idx = offset + count - 1;
+                int total = c.hidden_size;
+                residual_add_f16<<<(total + 255) / 256, 256>>>(
+                    m->buf_hidden + last_idx * c.hidden_size,
+                    m->buf_proj + s * c.hidden_size,
+                    m->buf_hidden + last_idx * c.hidden_size,
+                    total);
+                offset += count;
+            }
+        }
+
+        /* FFN on last tokens only. Extract, process, write back. */
+        {
+            /* Extract last-token hidden states for FFN. */
+            __half* d_ffn_input = nullptr;
+            cudaMalloc((void**)&d_ffn_input, n_seqs * c.hidden_size * sizeof(__half));
+            int offset = 0;
+            for (int s = 0; s < n_seqs; s++) {
+                int count = host_seq_token_counts[s];
+                int last_idx = offset + count - 1;
+                cudaMemcpy(
+                    d_ffn_input + s * c.hidden_size,
+                    m->buf_hidden + last_idx * c.hidden_size,
+                    c.hidden_size * sizeof(__half),
+                    cudaMemcpyDeviceToDevice);
+                offset += count;
+            }
+
+            /* RMSNorm (post_attention_layernorm). */
+            snprintf(name_buf, sizeof(name_buf), "model.layers.%d.post_attention_layernorm.weight", layer);
+            norm_weight = get_weight(m, name_buf);
+            if (!norm_weight) { cudaFree(d_ffn_input); model_set_error(m, name_buf); st = GOLLMGO_ERR_INVALID; goto cleanup; }
+
+            {
+                int threads = (c.hidden_size < 256) ? c.hidden_size : 256;
+                rmsnorm_f16<<<n_seqs, threads>>>(
+                    d_ffn_input, norm_weight, m->buf_norm,
+                    c.hidden_size, n_seqs, c.rms_norm_eps);
+            }
+
+            /* Gate and up projections. */
+            snprintf(name_buf, sizeof(name_buf), "model.layers.%d.mlp.gate_proj.weight", layer);
+            __half* w_gate = get_weight(m, name_buf);
+            snprintf(name_buf, sizeof(name_buf), "model.layers.%d.mlp.up_proj.weight", layer);
+            __half* w_up = get_weight(m, name_buf);
+            if (!w_gate || !w_up) { cudaFree(d_ffn_input); model_set_error(m, "missing gate/up weights"); st = GOLLMGO_ERR_INVALID; goto cleanup; }
+
+            st = gemm_f16(m, m->buf_norm, w_gate, m->buf_gate, n_seqs, c.intermediate_size, c.hidden_size);
+            if (st != GOLLMGO_OK) { cudaFree(d_ffn_input); goto cleanup; }
+            st = gemm_f16(m, m->buf_norm, w_up, m->buf_up, n_seqs, c.intermediate_size, c.hidden_size);
+            if (st != GOLLMGO_OK) { cudaFree(d_ffn_input); goto cleanup; }
+
+            /* SiLU * up. */
+            {
+                int total = n_seqs * c.intermediate_size;
+                silu_mul_f16<<<(total + 255) / 256, 256>>>(m->buf_gate, m->buf_up, m->buf_ffn, total);
+            }
+
+            /* Down projection. */
+            snprintf(name_buf, sizeof(name_buf), "model.layers.%d.mlp.down_proj.weight", layer);
+            __half* w_down = get_weight(m, name_buf);
+            if (!w_down) { cudaFree(d_ffn_input); model_set_error(m, "missing down_proj weight"); st = GOLLMGO_ERR_INVALID; goto cleanup; }
+
+            st = gemm_f16(m, m->buf_ffn, w_down, m->buf_ffn_out, n_seqs, c.hidden_size, c.intermediate_size);
+            if (st != GOLLMGO_OK) { cudaFree(d_ffn_input); goto cleanup; }
+
+            /* Residual add back to last-token positions in buf_hidden. */
+            offset = 0;
+            for (int s = 0; s < n_seqs; s++) {
+                int count = host_seq_token_counts[s];
+                int last_idx = offset + count - 1;
+                residual_add_f16<<<(c.hidden_size + 255) / 256, 256>>>(
+                    m->buf_hidden + last_idx * c.hidden_size,
+                    m->buf_ffn_out + s * c.hidden_size,
+                    m->buf_hidden + last_idx * c.hidden_size,
+                    c.hidden_size);
+                offset += count;
+            }
+
+            cudaFree(d_ffn_input);
+        }
+    }
+
+    /* ---- Final RMSNorm + LM head on last tokens only ---- */
+    {
+        __half* d_final_hidden = nullptr;
+        cudaMalloc((void**)&d_final_hidden, n_seqs * c.hidden_size * sizeof(__half));
+        int offset = 0;
+        for (int s = 0; s < n_seqs; s++) {
+            int count = host_seq_token_counts[s];
+            int last_idx = offset + count - 1;
+            cudaMemcpy(
+                d_final_hidden + s * c.hidden_size,
+                m->buf_hidden + last_idx * c.hidden_size,
+                c.hidden_size * sizeof(__half),
+                cudaMemcpyDeviceToDevice);
+            offset += count;
+        }
+
+        {
+            int threads = (c.hidden_size < 256) ? c.hidden_size : 256;
+            rmsnorm_f16<<<n_seqs, threads>>>(
+                d_final_hidden, get_weight(m, "model.norm.weight"), m->buf_norm,
+                c.hidden_size, n_seqs, c.rms_norm_eps);
+        }
+
+        st = gemm_f16(m, m->buf_norm, get_weight(m, "lm_head.weight"), m->buf_logits_f16,
+                       n_seqs, c.vocab_size, c.hidden_size);
+        cudaFree(d_final_hidden);
+        if (st != GOLLMGO_OK) goto cleanup;
+    }
+
+    /* Convert logits to F32 and copy to host. */
+    {
+        int total = n_seqs * c.vocab_size;
+        f16_to_f32<<<(total + 255) / 256, 256>>>(m->buf_logits_f16, m->buf_logits_f32, total);
+    }
+
+    st = model_check_cuda(m, cudaMemcpy(
+        host_logits_out, m->buf_logits_f32,
+        n_seqs * c.vocab_size * sizeof(float),
+        cudaMemcpyDeviceToHost));
+
+cleanup:
+    cudaFree(d_token_ids);
+    cudaFree(d_positions);
+    cudaFree(d_slot_mapping);
+    cudaFree(d_seq_lens);
+    cudaFree(d_slot_tables);
     return st;
 }
 

@@ -25,6 +25,8 @@ type ServingEngine struct {
 	eosID     int32
 	log       *slog.Logger
 
+	preemptWatermark float64
+
 	mu          sync.Mutex
 	blockTables map[uint64]*kvcache.BlockTable // seqID -> block table
 	subscribers map[uint64]chan TokenResult     // seqID -> token delivery channel
@@ -40,21 +42,29 @@ type ServingEngineConfig struct {
 	Tokenizer   model.Tokenizer
 	Sampling    SamplingParams
 	Log         *slog.Logger
+	// PreemptWatermark is the fraction of cache utilization above which
+	// the engine preempts the longest decode sequence to free blocks.
+	// 0 disables preemption. Default: 0.95.
+	PreemptWatermark float64
 }
 
 // NewServingEngine creates the engine. Call Start to begin the batching loop.
 func NewServingEngine(cfg ServingEngineConfig) *ServingEngine {
+	if cfg.PreemptWatermark <= 0 {
+		cfg.PreemptWatermark = 0.95
+	}
 	e := &ServingEngine{
-		runner:      cfg.Runner,
-		sched:       cfg.Scheduler,
-		cache:       cfg.Cache,
-		tokenizer:   cfg.Tokenizer,
-		sampler:     NewSampler(cfg.Sampling),
-		eosID:       cfg.Tokenizer.EOSTokenID(),
-		log:         cfg.Log,
-		blockTables: make(map[uint64]*kvcache.BlockTable),
-		subscribers: make(map[uint64]chan TokenResult),
-		loopDone:    make(chan struct{}),
+		runner:           cfg.Runner,
+		sched:            cfg.Scheduler,
+		cache:            cfg.Cache,
+		tokenizer:        cfg.Tokenizer,
+		sampler:          NewSampler(cfg.Sampling),
+		eosID:            cfg.Tokenizer.EOSTokenID(),
+		log:              cfg.Log,
+		preemptWatermark: cfg.PreemptWatermark,
+		blockTables:      make(map[uint64]*kvcache.BlockTable),
+		subscribers:      make(map[uint64]chan TokenResult),
+		loopDone:         make(chan struct{}),
 	}
 	metrics.Global.KVCacheBlocksTotal.Store(int64(cfg.Cache.NumTotalBlocks()))
 	return e
@@ -81,6 +91,9 @@ func (e *ServingEngine) loop(ctx context.Context) {
 			return
 		}
 		e.mu.Unlock()
+
+		// Check memory pressure before scheduling.
+		e.checkMemoryPressure()
 
 		out, err := e.sched.Tick(ctx)
 		if err != nil {
@@ -258,6 +271,60 @@ func (e *ServingEngine) Stop() error {
 
 	<-e.loopDone
 	return nil
+}
+
+// checkMemoryPressure preempts the longest decode sequence if cache
+// utilization exceeds the watermark. This frees blocks for new requests.
+func (e *ServingEngine) checkMemoryPressure() {
+	util := e.cache.Utilization()
+	if util < e.preemptWatermark {
+		return
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	// Find the decode sequence using the most blocks.
+	var victimID uint64
+	victimBlocks := 0
+	for seqID, bt := range e.blockTables {
+		if bt.NumBlocks() > victimBlocks {
+			victimBlocks = bt.NumBlocks()
+			victimID = seqID
+		}
+	}
+
+	if victimBlocks == 0 {
+		return
+	}
+
+	e.log.Warn("memory pressure preemption",
+		"utilization", util,
+		"watermark", e.preemptWatermark,
+		"victim_seq", victimID,
+		"victim_blocks", victimBlocks)
+
+	// Free blocks and notify subscriber of preemption error.
+	if bt, ok := e.blockTables[victimID]; ok {
+		bt.Free()
+		delete(e.blockTables, victimID)
+	}
+
+	errResult := TokenResult{
+		SequenceID: victimID,
+		Finished:   true,
+		Err:        fmt.Errorf("preempted: KV cache memory pressure (%.0f%% used)", util*100),
+	}
+	if ch, ok := e.subscribers[victimID]; ok {
+		select {
+		case ch <- errResult:
+		default:
+		}
+		close(ch)
+		delete(e.subscribers, victimID)
+	}
+
+	e.sched.Complete(victimID)
 }
 
 func (e *ServingEngine) cleanupSequence(seqID uint64) {

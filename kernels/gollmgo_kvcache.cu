@@ -143,6 +143,14 @@ gollmgo_status_t gollmgo_kvcache_attention(gollmgo_kvcache_t cache,
     return GOLLMGO_OK;
 }
 
+void* gollmgo_kvcache_k_ptr(gollmgo_kvcache_t cache) {
+    return cache ? (void*)cache->k_cache : nullptr;
+}
+
+void* gollmgo_kvcache_v_ptr(gollmgo_kvcache_t cache) {
+    return cache ? (void*)cache->v_cache : nullptr;
+}
+
 gollmgo_status_t gollmgo_kvcache_destroy(gollmgo_kvcache_t cache) {
     if (!cache) return GOLLMGO_OK;
     cudaFree(cache->k_cache);

@@ -70,6 +70,40 @@ gollmgo_status_t gollmgo_model_forward(gollmgo_backend_t b,
                                         int n_tokens,
                                         float* logits_out);
 
+/*
+ * Execute one forward pass with paged KV cache.
+ *
+ * This replaces gollmgo_model_forward for production serving.
+ * The caller provides KV cache pointers and per-token slot mappings
+ * from the Go-side block table manager.
+ *
+ * k_cache/v_cache:  [num_slots, num_kv_heads, head_dim] device pointers
+ * slot_mapping:     [n_tokens] physical slot for each input token
+ * seq_lens:         [n_seqs] total cached KV length per sequence (for attention)
+ * slot_tables:      [n_seqs * max_context_len] full slot table per sequence
+ * n_seqs:           number of sequences in this batch
+ * max_context_len:  padding dimension for slot_tables
+ * seq_token_counts: [n_seqs] how many tokens this sequence contributes to the batch
+ *
+ * Logits are returned only for the last token of each sequence.
+ * logits_out:       [n_seqs * vocab_size] host memory
+ */
+gollmgo_status_t gollmgo_model_forward_paged(
+    gollmgo_backend_t b,
+    gollmgo_model_t m,
+    const int32_t* token_ids,
+    const int32_t* positions,
+    const int32_t* slot_mapping,
+    int n_tokens,
+    void* k_cache,             /* device pointer */
+    void* v_cache,             /* device pointer */
+    const int32_t* seq_lens,
+    const int32_t* slot_tables,
+    int n_seqs,
+    int max_context_len,
+    const int32_t* seq_token_counts,
+    float* logits_out);
+
 /* Destroy model and free all GPU memory. */
 gollmgo_status_t gollmgo_model_destroy(gollmgo_model_t m);
 

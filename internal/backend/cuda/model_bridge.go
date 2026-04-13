@@ -108,6 +108,46 @@ func (m *CUDAModel) Forward(_ context.Context, tokenIDs []int32, positions []int
 	return logits, nil
 }
 
+// ForwardPaged runs one forward pass with paged KV cache.
+func (m *CUDAModel) ForwardPaged(
+	_ context.Context,
+	tokenIDs, positions, slotMapping []int32,
+	kvCache *CUDAKVCache,
+	seqLens, slotTables []int32,
+	nSeqs, maxContextLen int,
+	seqTokenCounts []int32,
+) ([]float32, error) {
+	nTokens := len(tokenIDs)
+	if nTokens == 0 {
+		return nil, fmt.Errorf("cuda: empty token input")
+	}
+
+	vocabSize := m.config.VocabSize
+	logits := make([]float32, nSeqs*vocabSize)
+
+	status := C.gollmgo_model_forward_paged(
+		m.backend,
+		m.handle,
+		(*C.int32_t)(unsafe.Pointer(&tokenIDs[0])),
+		(*C.int32_t)(unsafe.Pointer(&positions[0])),
+		(*C.int32_t)(unsafe.Pointer(&slotMapping[0])),
+		C.int(nTokens),
+		unsafe.Pointer(kvCache.KCacheDevPtr()),
+		unsafe.Pointer(kvCache.VCacheDevPtr()),
+		(*C.int32_t)(unsafe.Pointer(&seqLens[0])),
+		(*C.int32_t)(unsafe.Pointer(&slotTables[0])),
+		C.int(nSeqs),
+		C.int(maxContextLen),
+		(*C.int32_t)(unsafe.Pointer(&seqTokenCounts[0])),
+		(*C.float)(unsafe.Pointer(&logits[0])),
+	)
+	if status != C.GOLLMGO_OK {
+		return nil, fmt.Errorf("cuda: forward_paged failed (status %d)", int(status))
+	}
+
+	return logits, nil
+}
+
 // Close destroys the model and frees GPU memory.
 func (m *CUDAModel) Close() error {
 	if m.handle != nil {
@@ -118,32 +158,44 @@ func (m *CUDAModel) Close() error {
 }
 
 // CUDARunnerWithModel wraps CUDARunner + CUDAModel to implement backend.Runner.Step().
+// If KVCache is set, Step uses the paged forward pass. Otherwise, eager.
 type CUDARunnerWithModel struct {
 	*CUDARunner
-	Model *CUDAModel
+	Model   *CUDAModel
+	KVCache *CUDAKVCache
+	// SeqSlotTables is populated by the Go-side engine for each step.
+	// Maps seqID -> full slot table for that sequence.
+	SeqSlotTables map[uint64][]int32
+	// SeqContextLens maps seqID -> total cached KV length.
+	SeqContextLens map[uint64]int32
 }
 
 // Step executes a forward pass using the loaded model.
+// If the batch has SlotMapping and a KVCache is configured, uses paged attention.
+// Otherwise falls back to eager (naive attention).
 func (r *CUDARunnerWithModel) Step(ctx context.Context, batch *backend.Batch) (*backend.StepOutput, error) {
 	if r.Model == nil {
 		return nil, fmt.Errorf("cuda: no model loaded")
 	}
 
+	nSeq := len(batch.SequenceIDs)
+	vocabSize := r.Model.config.VocabSize
+
+	// Use paged forward when slot mappings and KV cache are available.
+	if len(batch.SlotMapping) > 0 && r.KVCache != nil {
+		return r.stepPaged(ctx, batch, nSeq, vocabSize)
+	}
+
+	return r.stepEager(ctx, batch, nSeq, vocabSize)
+}
+
+func (r *CUDARunnerWithModel) stepEager(ctx context.Context, batch *backend.Batch, nSeq, vocabSize int) (*backend.StepOutput, error) {
 	logits, err := r.Model.Forward(ctx, batch.TokenIDs, batch.Positions)
 	if err != nil {
 		return nil, err
 	}
 
-	vocabSize := r.Model.config.VocabSize
-	nSeq := len(batch.SequenceIDs)
-	out := &backend.StepOutput{
-		Logits: make([][]float32, nSeq),
-	}
-
-	// For each sequence, extract the last token's logits.
-	// In eager mode (M5), all tokens are passed; we take the last token per sequence.
-	// For now, assume tokens are ordered per-sequence and we return the logits
-	// for the last n_seq tokens.
+	out := &backend.StepOutput{Logits: make([][]float32, nSeq)}
 	totalTokens := len(batch.TokenIDs)
 	for i := 0; i < nSeq; i++ {
 		tokenIdx := totalTokens - nSeq + i
@@ -157,6 +209,96 @@ func (r *CUDARunnerWithModel) Step(ctx context.Context, batch *backend.Batch) (*
 		}
 		out.Logits[i] = logits[start:end]
 	}
+	return out, nil
+}
 
+func (r *CUDARunnerWithModel) stepPaged(ctx context.Context, batch *backend.Batch, nSeq, vocabSize int) (*backend.StepOutput, error) {
+	// Build per-sequence metadata for the paged forward C API.
+	seqTokenCounts := make([]int32, nSeq)
+	seqLens := make([]int32, nSeq)
+
+	// Count tokens per sequence in the batch.
+	// Tokens are ordered per-sequence: all tokens of seq 0, then seq 1, etc.
+	tokenOffset := 0
+	for i, sid := range batch.SequenceIDs {
+		if batch.IsPrefill[i] {
+			// Prefill: prompt tokens are in the batch.
+			count := 0
+			for j := tokenOffset; j < len(batch.TokenIDs); j++ {
+				if j < len(batch.Positions) && (i+1 >= nSeq || j < tokenOffset+int(batch.Positions[tokenOffset])+100) {
+					count++
+				} else {
+					break
+				}
+			}
+			// Simpler: scan positions to find boundary.
+			count = 0
+			for j := tokenOffset; j < len(batch.TokenIDs); j++ {
+				count++
+				if j+1 >= len(batch.TokenIDs) {
+					break
+				}
+				// Next token has a lower position -> new sequence.
+				if j+1 < len(batch.Positions) && batch.Positions[j+1] <= batch.Positions[j] && j+1-tokenOffset > 0 {
+					break
+				}
+			}
+			seqTokenCounts[i] = int32(count)
+			tokenOffset += count
+		} else {
+			// Decode: exactly 1 token.
+			seqTokenCounts[i] = 1
+			tokenOffset++
+		}
+
+		// Context length: look up from engine-provided map, or infer.
+		if r.SeqContextLens != nil {
+			seqLens[i] = r.SeqContextLens[sid]
+		}
+	}
+
+	// Build flattened slot tables.
+	maxContextLen := int32(0)
+	for _, l := range seqLens {
+		if l > maxContextLen {
+			maxContextLen = l
+		}
+	}
+	if maxContextLen == 0 {
+		maxContextLen = 1
+	}
+
+	slotTables := make([]int32, nSeq*int(maxContextLen))
+	if r.SeqSlotTables != nil {
+		for i, sid := range batch.SequenceIDs {
+			table := r.SeqSlotTables[sid]
+			for j := 0; j < len(table) && j < int(maxContextLen); j++ {
+				slotTables[i*int(maxContextLen)+j] = table[j]
+			}
+		}
+	}
+
+	logits, err := r.Model.ForwardPaged(
+		ctx,
+		batch.TokenIDs, batch.Positions, batch.SlotMapping,
+		r.KVCache,
+		seqLens, slotTables,
+		nSeq, int(maxContextLen),
+		seqTokenCounts,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// Paged forward returns [nSeq * vocabSize] logits (one per sequence).
+	out := &backend.StepOutput{Logits: make([][]float32, nSeq)}
+	for i := 0; i < nSeq; i++ {
+		start := i * vocabSize
+		end := start + vocabSize
+		if end > len(logits) {
+			return nil, fmt.Errorf("cuda: logits index out of range")
+		}
+		out.Logits[i] = logits[start:end]
+	}
 	return out, nil
 }
