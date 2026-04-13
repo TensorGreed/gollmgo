@@ -18,9 +18,9 @@ This plan is meant to compress well when you want to fast-track work.
 - [x] M2: Operator surface thin slice
 - [x] M3: CUDA backend bring-up
 - [x] M4: Model and tokenizer layer
-- [ ] M5: Correct eager inference
-- [ ] M6: KV cache and paged attention
-- [ ] M7: Continuous batching and Phase 1 exit gate
+- [x] M5: Correct eager inference
+- [x] M6: KV cache and paged attention
+- [x] M7: Continuous batching and Phase 1 exit gate
 
 ---
 

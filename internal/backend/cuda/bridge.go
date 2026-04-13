@@ -9,7 +9,7 @@ package cuda
 
 /*
 #cgo CFLAGS: -I${SRCDIR}/../../../kernels
-#cgo LDFLAGS: -L${SRCDIR}/../../../kernels -L/usr/local/cuda/targets/sbsa-linux/lib -lgollmgo_backend -lcudart -lstdc++
+#cgo LDFLAGS: -L${SRCDIR}/../../../kernels -L/usr/local/cuda/targets/sbsa-linux/lib -lgollmgo_kvcache -lgollmgo_paged_attn -lgollmgo_model -lgollmgo_ops -lgollmgo_backend -lcublas -lcudart -lstdc++ -lm
 #include "gollmgo_backend.h"
 #include <stdlib.h>
 */
