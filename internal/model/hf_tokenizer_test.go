@@ -91,8 +91,8 @@ func TestHFTokenizerReferenceMatch(t *testing.T) {
 	ids, _ := tok.Encode("What is 2+2? ")
 	t.Logf("Our IDs:  %v", ids)
 	// HF produces [1, 1724, 338, 29871, 29906, 29974, 29906, 29973, 29871]
-	// with BOS=1 prepended. Our tokenizer does not prepend BOS.
-	expected := []int32{1724, 338, 29871, 29906, 29974, 29906, 29973, 29871}
+	// with BOS=1 prepended. Our tokenizer now also prepends BOS.
+	expected := []int32{1, 1724, 338, 29871, 29906, 29974, 29906, 29973, 29871}
 	if len(ids) != len(expected) {
 		t.Fatalf("length mismatch: got %d, want %d\nOur: %v\nHF:  %v", len(ids), len(expected), ids, expected)
 	}

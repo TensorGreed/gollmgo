@@ -17,6 +17,7 @@ type HFTokenizer struct {
 	eosID     int32
 	bosID     int32
 	vocabSize int
+	addBOS    bool // prepend BOS token to every encode
 }
 
 type mergePair struct {
@@ -95,12 +96,13 @@ func LoadHFTokenizer(path string, eosToken, bosToken string) (*HFTokenizer, erro
 	}
 
 	return &HFTokenizer{
-		vocab:     vocab,
-		invVocab:  invVocab,
-		merges:    merges,
-		eosID:     eosID,
-		bosID:     bosID,
-		vocabSize: int(maxID + 1),
+		vocab:      vocab,
+		invVocab:   invVocab,
+		merges:     merges,
+		eosID:      eosID,
+		bosID:      bosID,
+		vocabSize:  int(maxID + 1),
+		addBOS:     bosID >= 0, // prepend BOS if available
 	}, nil
 }
 
@@ -203,6 +205,11 @@ func (t *HFTokenizer) Encode(text string) ([]int32, error) {
 		}
 	}
 
+	// Prepend BOS token if configured.
+	if t.addBOS && t.bosID >= 0 {
+		ids = append([]int32{t.bosID}, ids...)
+	}
+
 	return ids, nil
 }
 
@@ -211,6 +218,10 @@ func (t *HFTokenizer) Decode(ids []int32) (string, error) {
 	var sb strings.Builder
 	for _, id := range ids {
 		if id < 0 || int(id) >= len(t.invVocab) {
+			continue
+		}
+		// Skip BOS/EOS special tokens in decode output.
+		if id == t.bosID || id == t.eosID {
 			continue
 		}
 		sb.WriteString(t.invVocab[id])
