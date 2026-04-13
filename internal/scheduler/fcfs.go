@@ -10,17 +10,19 @@ import (
 
 // FCFSConfig configures the FCFS scheduler.
 type FCFSConfig struct {
-	MaxBatchSize   int // max sequences per batch
-	MaxTokenBudget int // max total tokens (prefill + decode) per tick
-	MaxQueueDepth  int // max waiting queue length (0 = unbounded)
+	MaxBatchSize     int // max sequences per batch
+	MaxTokenBudget   int // max total tokens (prefill + decode) per tick
+	MaxQueueDepth    int // max waiting queue length (0 = unbounded)
+	PrefillChunkSize int // max prefill tokens per sequence per tick (0 = no chunking)
 }
 
 // DefaultFCFSConfig returns reasonable defaults.
 func DefaultFCFSConfig() FCFSConfig {
 	return FCFSConfig{
-		MaxBatchSize:   64,
-		MaxTokenBudget: 4096,
-		MaxQueueDepth:  256,
+		MaxBatchSize:     64,
+		MaxTokenBudget:   4096,
+		MaxQueueDepth:    256,
+		PrefillChunkSize: 512,
 	}
 }
 
@@ -73,15 +75,23 @@ func (s *FCFSScheduler) Tick(_ context.Context) (*SchedulerOutput, error) {
 	out := &SchedulerOutput{}
 	batchSize := 0
 	tokenBudget := s.cfg.MaxTokenBudget
+	chunkSize := s.cfg.PrefillChunkSize
+	if chunkSize <= 0 {
+		chunkSize = 1<<30 // effectively unlimited
+	}
 
 	// 1. Collect active decode sequences in deterministic order (by seq ID).
 	decodeIDs := make([]uint64, 0, len(s.active))
+	prefillIDs := make([]uint64, 0)
 	for id, seq := range s.active {
 		if seq.State == SeqDecoding {
 			decodeIDs = append(decodeIDs, id)
+		} else if seq.State == SeqPrefilling {
+			prefillIDs = append(prefillIDs, id)
 		}
 	}
 	sort.Slice(decodeIDs, func(i, j int) bool { return decodeIDs[i] < decodeIDs[j] })
+	sort.Slice(prefillIDs, func(i, j int) bool { return prefillIDs[i] < prefillIDs[j] })
 
 	for _, id := range decodeIDs {
 		if batchSize >= s.cfg.MaxBatchSize {
@@ -93,7 +103,30 @@ func (s *FCFSScheduler) Tick(_ context.Context) (*SchedulerOutput, error) {
 		batchSize++
 	}
 
-	// 2. Admit new sequences from waiting queue (FCFS order).
+	// 2. Resume partially-prefilled sequences (chunked prefill continuation).
+	for _, id := range prefillIDs {
+		if batchSize >= s.cfg.MaxBatchSize || tokenBudget <= 0 {
+			break
+		}
+		seq := s.active[id]
+		remaining := seq.PromptLen - seq.PrefillConsumed
+		chunk := remaining
+		if chunk > chunkSize {
+			chunk = chunkSize
+		}
+		if chunk > tokenBudget {
+			chunk = tokenBudget
+		}
+		if chunk <= 0 {
+			continue
+		}
+		out.ScheduledSequences = append(out.ScheduledSequences, seq)
+		out.PrefillBudgetUsed += chunk
+		tokenBudget -= chunk
+		batchSize++
+	}
+
+	// 3. Admit new sequences from waiting queue (FCFS order).
 	remaining := s.waiting[:0]
 	for _, seq := range s.waiting {
 		if batchSize >= s.cfg.MaxBatchSize || tokenBudget <= 0 {
@@ -101,10 +134,12 @@ func (s *FCFSScheduler) Tick(_ context.Context) (*SchedulerOutput, error) {
 			continue
 		}
 
-		prefillCost := seq.PromptLen
-		if prefillCost > tokenBudget {
-			// This sequence's prefill doesn't fit in remaining budget.
-			// Keep it in the queue for next tick.
+		// With chunked prefill, the first chunk cost is min(promptLen, chunkSize).
+		firstChunk := seq.PromptLen
+		if firstChunk > chunkSize {
+			firstChunk = chunkSize
+		}
+		if firstChunk > tokenBudget {
 			remaining = append(remaining, seq)
 			continue
 		}
@@ -117,8 +152,8 @@ func (s *FCFSScheduler) Tick(_ context.Context) (*SchedulerOutput, error) {
 
 		s.active[seq.ID] = seq
 		out.ScheduledSequences = append(out.ScheduledSequences, seq)
-		out.PrefillBudgetUsed += prefillCost
-		tokenBudget -= prefillCost
+		out.PrefillBudgetUsed += firstChunk
+		tokenBudget -= firstChunk
 		batchSize++
 	}
 	s.waiting = remaining
@@ -181,6 +216,18 @@ func (s *FCFSScheduler) ActiveLen() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.active)
+}
+
+// Find returns a sequence by ID, or nil if not tracked.
+func (s *FCFSScheduler) Find(seqID uint64) *Sequence {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.all[seqID]
+}
+
+// PrefillChunkSize returns the configured chunk size for prefill budgeting.
+func (s *FCFSScheduler) PrefillChunkSize() int {
+	return s.cfg.PrefillChunkSize
 }
 
 // Compile-time check.

@@ -65,7 +65,7 @@ func initGPURunner(log *slog.Logger, cfg config.Config, deviceID int) (backend.R
 	log.Info("weight tensors loaded", "count", len(tensors))
 
 	// --- Create CUDA model ---
-	cudaModel, err := cuda.LoadModel(runner, meta, hfCfg.IntermediateSize)
+	cudaModel, err := cuda.LoadModel(runner, meta, hfCfg.IntermediateSize, cfg.Quantization)
 	if err != nil {
 		runner.Close()
 		return nil, nil, 0, fmt.Errorf("create CUDA model: %w", err)

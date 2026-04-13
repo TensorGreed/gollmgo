@@ -64,6 +64,16 @@ func (s *Server) MetricsHandler() http.HandlerFunc {
 		gaugeF(w, "gollmgo_itl_p99_ms", "Server-side ITL P99 (ms).", itl.P99)
 		gauge(w, "gollmgo_itl_count", "ITL sample count.",
 			"counter", itl.Count)
+
+		// --- Speculative decoding ---
+		gauge(w, "gollmgo_spec_draft_tokens_total", "Total speculative draft tokens proposed.",
+			"counter", metrics.Global.SpecDraftTokens.Load())
+		gauge(w, "gollmgo_spec_accepted_tokens_total", "Total speculative draft tokens accepted.",
+			"counter", metrics.Global.SpecAcceptedTokens.Load())
+		gaugeF(w, "gollmgo_spec_acceptance_rate", "Speculative decode acceptance ratio.",
+			metrics.Global.SpecAcceptanceRate())
+		gauge(w, "gollmgo_spec_kill_active", "1 if speculative decode kill switch is active.",
+			"gauge", metrics.Global.SpecKillActive.Load())
 	}
 }
 

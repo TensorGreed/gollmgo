@@ -468,6 +468,27 @@ __global__ void bf16_to_f32(
     out[idx] = __bfloat162float(in[idx]);
 }
 
+/* ---- F32 to half-precision ---- */
+__global__ void f32_to_f16(
+    const float* __restrict__ in,
+    __half* __restrict__ out,
+    int total_elements)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_elements) return;
+    out[idx] = __float2half(in[idx]);
+}
+
+__global__ void f32_to_bf16(
+    const float* __restrict__ in,
+    __nv_bfloat16* __restrict__ out,
+    int total_elements)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_elements) return;
+    out[idx] = __float2bfloat16(in[idx]);
+}
+
 /* ---- Cross-dtype conversions ---- */
 __global__ void f16_to_bf16(
     const __half* __restrict__ in,

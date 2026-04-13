@@ -87,7 +87,7 @@ void silu_mul_cpu(const float* gate, const float* up, float* out, int n) {
 }
 
 /* ---- Helpers ---- */
-void f32_to_f16(const float* in, __half* out, int n) {
+void f32_to_f16_host(const float* in, __half* out, int n) {
     for (int i = 0; i < n; i++) out[i] = __float2half(in[i]);
 }
 void f16_to_f32_cpu(const __half* in, float* out, int n) {
@@ -117,8 +117,8 @@ void test_rmsnorm() {
     __half *h_w16 = new __half[hidden];
     __half *h_out16 = new __half[n * hidden];
 
-    f32_to_f16(h_x, h_x16, n * hidden);
-    f32_to_f16(h_weight, h_w16, hidden);
+    f32_to_f16_host(h_x, h_x16, n * hidden);
+    f32_to_f16_host(h_weight, h_w16, hidden);
 
     CHECK_CUDA(cudaMalloc(&d_x, n * hidden * sizeof(__half)));
     CHECK_CUDA(cudaMalloc(&d_w, hidden * sizeof(__half)));
@@ -163,8 +163,8 @@ void test_silu_mul() {
     __half *d_gate, *d_up, *d_out;
     __half *h_g16 = new __half[n], *h_u16 = new __half[n], *h_o16 = new __half[n];
 
-    f32_to_f16(h_gate, h_g16, n);
-    f32_to_f16(h_up, h_u16, n);
+    f32_to_f16_host(h_gate, h_g16, n);
+    f32_to_f16_host(h_up, h_u16, n);
 
     CHECK_CUDA(cudaMalloc(&d_gate, n * sizeof(__half)));
     CHECK_CUDA(cudaMalloc(&d_up, n * sizeof(__half)));
@@ -202,7 +202,7 @@ void test_embedding() {
     }
 
     __half* h_t16 = new __half[vocab * hidden];
-    f32_to_f16(h_table, h_t16, vocab * hidden);
+    f32_to_f16_host(h_table, h_t16, vocab * hidden);
 
     __half *d_table, *d_out;
     int32_t* d_ids;
@@ -237,7 +237,7 @@ void test_embedding() {
 }
 
 /* ---- BF16 Helpers ---- */
-void f32_to_bf16(const float* in, __nv_bfloat16* out, int n) {
+void f32_to_bf16_host(const float* in, __nv_bfloat16* out, int n) {
     for (int i = 0; i < n; i++) out[i] = __float2bfloat16(in[i]);
 }
 void bf16_to_f32_cpu(const __nv_bfloat16* in, float* out, int n) {
@@ -266,8 +266,8 @@ void test_rmsnorm_bf16() {
     __nv_bfloat16 *h_w16 = new __nv_bfloat16[hidden];
     __nv_bfloat16 *h_out16 = new __nv_bfloat16[n * hidden];
 
-    f32_to_bf16(h_x, h_x16, n * hidden);
-    f32_to_bf16(h_weight, h_w16, hidden);
+    f32_to_bf16_host(h_x, h_x16, n * hidden);
+    f32_to_bf16_host(h_weight, h_w16, hidden);
 
     CHECK_CUDA(cudaMalloc(&d_x, n * hidden * sizeof(__nv_bfloat16)));
     CHECK_CUDA(cudaMalloc(&d_w, hidden * sizeof(__nv_bfloat16)));
@@ -312,8 +312,8 @@ void test_silu_mul_bf16() {
     __nv_bfloat16 *d_gate, *d_up, *d_out;
     __nv_bfloat16 *h_g16 = new __nv_bfloat16[n], *h_u16 = new __nv_bfloat16[n], *h_o16 = new __nv_bfloat16[n];
 
-    f32_to_bf16(h_gate, h_g16, n);
-    f32_to_bf16(h_up, h_u16, n);
+    f32_to_bf16_host(h_gate, h_g16, n);
+    f32_to_bf16_host(h_up, h_u16, n);
 
     CHECK_CUDA(cudaMalloc(&d_gate, n * sizeof(__nv_bfloat16)));
     CHECK_CUDA(cudaMalloc(&d_up, n * sizeof(__nv_bfloat16)));
@@ -350,7 +350,7 @@ void test_embedding_bf16() {
     }
 
     __nv_bfloat16* h_t16 = new __nv_bfloat16[vocab * hidden];
-    f32_to_bf16(h_table, h_t16, vocab * hidden);
+    f32_to_bf16_host(h_table, h_t16, vocab * hidden);
 
     __nv_bfloat16 *d_table, *d_out;
     int32_t* d_ids;
@@ -393,7 +393,7 @@ void test_dtype_conversion() {
 
     /* F16 -> BF16 -> F16 round trip */
     __half* h_f16 = new __half[n];
-    f32_to_f16(h_vals, h_f16, n);
+    f32_to_f16_host(h_vals, h_f16, n);
 
     __half *d_f16_in, *d_f16_out;
     __nv_bfloat16 *d_bf16;

@@ -81,6 +81,48 @@ func (bt *BlockTable) NumTokens() int { return bt.numTokens }
 // NumBlocks returns the number of allocated blocks.
 func (bt *BlockTable) NumBlocks() int { return len(bt.blocks) }
 
+// MatchPrefix checks the prefix cache for reusable blocks and attaches them.
+// Returns the number of tokens that are already cached (always a multiple of blockSize).
+// The caller should skip these tokens during prefill.
+func (bt *BlockTable) MatchPrefix(tokenIDs []int32, cache *PrefixCache) int {
+	if cache == nil || len(tokenIDs) == 0 {
+		return 0
+	}
+	blockSize := bt.pool.BlockSize()
+	chainHash := uint64(0)
+	matched := 0
+
+	for start := 0; start+blockSize <= len(tokenIDs); start += blockSize {
+		chainHash = ChainHash(chainHash, tokenIDs[start:start+blockSize])
+		blockID, ok := cache.Lookup(chainHash)
+		if !ok {
+			break
+		}
+		bt.blocks = append(bt.blocks, blockID)
+		bt.numTokens += blockSize
+		matched += blockSize
+	}
+	return matched
+}
+
+// Truncate removes the last n token slots, freeing any blocks that become empty.
+// Used to roll back rejected speculative decode tokens.
+func (bt *BlockTable) Truncate(n int) {
+	if n <= 0 || n > bt.numTokens {
+		return
+	}
+	blockSize := bt.pool.BlockSize()
+	for i := 0; i < n; i++ {
+		bt.numTokens--
+		// If this was the first token in a block, free the block.
+		if bt.numTokens%blockSize == 0 && len(bt.blocks) > bt.numTokens/blockSize {
+			last := len(bt.blocks) - 1
+			bt.pool.Release(bt.blocks[last])
+			bt.blocks = bt.blocks[:last]
+		}
+	}
+}
+
 // Free releases all blocks back to the pool.
 func (bt *BlockTable) Free() {
 	bt.pool.Free(bt.blocks)

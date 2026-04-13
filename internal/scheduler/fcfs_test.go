@@ -201,6 +201,109 @@ func TestFCFSPreempt(t *testing.T) {
 	}
 }
 
+func TestChunkedPrefill_LargePromptSplitsAcrossTicks(t *testing.T) {
+	sched := NewFCFSScheduler(FCFSConfig{
+		MaxBatchSize:     10,
+		MaxTokenBudget:   10000,
+		MaxQueueDepth:    100,
+		PrefillChunkSize: 512,
+	})
+
+	prompt := make([]int32, 2048) // 2048 tokens → 4 chunks of 512
+	seq := NewSequence("r1", prompt, 10)
+	sched.Add(seq)
+
+	// Tick 1: first chunk (512 tokens).
+	out, _ := sched.Tick(context.Background())
+	if len(out.ScheduledSequences) != 1 {
+		t.Fatalf("tick 1: expected 1, got %d", len(out.ScheduledSequences))
+	}
+	if out.PrefillBudgetUsed != 512 {
+		t.Fatalf("tick 1: expected 512 prefill, got %d", out.PrefillBudgetUsed)
+	}
+	if seq.State != SeqPrefilling {
+		t.Fatalf("tick 1: expected PREFILLING, got %s", seq.State)
+	}
+	// Simulate engine processing: advance PrefillConsumed.
+	seq.PrefillConsumed = 512
+
+	// Tick 2-4: subsequent chunks.
+	for tick := 2; tick <= 4; tick++ {
+		out, _ = sched.Tick(context.Background())
+		if len(out.ScheduledSequences) != 1 {
+			t.Fatalf("tick %d: expected 1, got %d", tick, len(out.ScheduledSequences))
+		}
+		seq.PrefillConsumed += 512
+	}
+
+	if seq.PrefillConsumed != 2048 {
+		t.Fatalf("expected 2048 consumed, got %d", seq.PrefillConsumed)
+	}
+}
+
+func TestChunkedPrefill_DecodeNotStarved(t *testing.T) {
+	sched := NewFCFSScheduler(FCFSConfig{
+		MaxBatchSize:     10,
+		MaxTokenBudget:   10000,
+		MaxQueueDepth:    100,
+		PrefillChunkSize: 256,
+	})
+
+	// Start 3 short sequences and complete their prefill.
+	for i := 0; i < 3; i++ {
+		s := NewSequence("d", []int32{1, 2}, 100)
+		sched.Add(s)
+		sched.Tick(context.Background())
+		s.PrefillConsumed = 2
+		s.Transition(SeqDecoding)
+		s.AppendToken(99)
+	}
+
+	// Add a long prompt (2048 tokens).
+	long := NewSequence("long", make([]int32, 2048), 10)
+	sched.Add(long)
+
+	// Tick: should schedule 3 decode + 1 chunked prefill.
+	out, _ := sched.Tick(context.Background())
+	if len(out.ScheduledSequences) != 4 {
+		t.Fatalf("expected 4 (3 decode + 1 prefill), got %d", len(out.ScheduledSequences))
+	}
+	if out.DecodeBudgetUsed != 3 {
+		t.Fatalf("expected 3 decode, got %d", out.DecodeBudgetUsed)
+	}
+	// Prefill should be chunked to 256, not 2048.
+	if out.PrefillBudgetUsed != 256 {
+		t.Fatalf("expected 256 prefill (chunked), got %d", out.PrefillBudgetUsed)
+	}
+}
+
+func TestChunkedPrefill_NoBudgetStarvation(t *testing.T) {
+	sched := NewFCFSScheduler(FCFSConfig{
+		MaxBatchSize:     10,
+		MaxTokenBudget:   600,
+		MaxQueueDepth:    100,
+		PrefillChunkSize: 256,
+	})
+
+	// Add one long prompt and two short ones.
+	longSeq := NewSequence("long", make([]int32, 4096), 10)
+	short1 := NewSequence("s1", []int32{1, 2, 3}, 10)
+	short2 := NewSequence("s2", []int32{4, 5}, 10)
+	sched.Add(longSeq)
+	sched.Add(short1)
+	sched.Add(short2)
+
+	// Tick 1: long gets first chunk (256), short1 (3) and short2 (2) should also be admitted.
+	out, _ := sched.Tick(context.Background())
+	if len(out.ScheduledSequences) != 3 {
+		t.Fatalf("expected 3 scheduled, got %d", len(out.ScheduledSequences))
+	}
+	// Total prefill: 256 + 3 + 2 = 261
+	if out.PrefillBudgetUsed != 261 {
+		t.Fatalf("expected 261 total prefill, got %d", out.PrefillBudgetUsed)
+	}
+}
+
 func TestFCFSEmptyTick(t *testing.T) {
 	sched := NewFCFSScheduler(DefaultFCFSConfig())
 	out, err := sched.Tick(context.Background())

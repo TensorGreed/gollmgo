@@ -91,3 +91,43 @@ func TestBlockTableOOM(t *testing.T) {
 		t.Fatal("expected OOM error")
 	}
 }
+
+func TestBlockTableTruncate(t *testing.T) {
+	pool := NewBlockPool(10, 4) // 4 tokens per block
+	bt := NewBlockTable(1, pool)
+
+	// Append 6 tokens (2 blocks: block0=[0..3], block1=[4,5])
+	_, err := bt.AppendN(6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bt.NumTokens() != 6 {
+		t.Fatalf("expected 6 tokens, got %d", bt.NumTokens())
+	}
+	if bt.NumBlocks() != 2 {
+		t.Fatalf("expected 2 blocks, got %d", bt.NumBlocks())
+	}
+
+	// Truncate 2 tokens → back to 4 tokens (block1 should be freed).
+	bt.Truncate(2)
+	if bt.NumTokens() != 4 {
+		t.Fatalf("expected 4 tokens after truncate, got %d", bt.NumTokens())
+	}
+	if bt.NumBlocks() != 1 {
+		t.Fatalf("expected 1 block after truncate (freed block1), got %d", bt.NumBlocks())
+	}
+
+	// Pool should have 9 free blocks (10 - 1 still in use).
+	if pool.NumFreeBlocks() != 9 {
+		t.Fatalf("expected 9 free blocks, got %d", pool.NumFreeBlocks())
+	}
+}
+
+func TestBlockTableTruncateEmpty(t *testing.T) {
+	pool := NewBlockPool(10, 4)
+	bt := NewBlockTable(1, pool)
+	bt.Truncate(5) // no-op on empty table
+	if bt.NumTokens() != 0 {
+		t.Fatalf("expected 0 tokens, got %d", bt.NumTokens())
+	}
+}

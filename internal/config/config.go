@@ -20,8 +20,23 @@ type Config struct {
 	BlockSize         int     `json:"block_size"`
 	MaxMemoryFraction float64 `json:"max_memory_fraction"`
 
+	// Quantization: "" (none), "fp8", "int8".
+	Quantization string `json:"quantization"`
+
+	// Speculative decoding.
+	Speculative SpeculativeConfig `json:"speculative"`
+
 	// Logging.
 	LogLevel string `json:"log_level"`
+}
+
+// SpeculativeConfig controls speculative decoding behavior.
+type SpeculativeConfig struct {
+	Enabled        bool    `json:"enabled"`
+	Mode           string  `json:"mode"`             // "ngram" or "draft"
+	NGramSize      int     `json:"ngram_size"`        // default 3
+	NumDraftTokens int     `json:"num_draft_tokens"`  // K, default 4
+	KillThreshold  float64 `json:"kill_threshold"`    // auto-disable below this acceptance rate
 }
 
 // DefaultConfig returns a Config with production-reasonable defaults.

@@ -14,6 +14,7 @@ import (
 	"unsafe"
 
 	"github.com/TensorGreed/gollmgo/internal/backend"
+	"github.com/TensorGreed/gollmgo/internal/metrics"
 	"github.com/TensorGreed/gollmgo/internal/model"
 )
 
@@ -25,10 +26,19 @@ type CUDAModel struct {
 }
 
 // LoadModel creates a CUDA model and loads weights from safetensors data.
-func LoadModel(runner *CUDARunner, meta *model.ModelMeta, intermediateSize int) (*CUDAModel, error) {
+// quantization: "" (none), "fp8", "int8".
+func LoadModel(runner *CUDARunner, meta *model.ModelMeta, intermediateSize int, quantization string) (*CUDAModel, error) {
 	dtypeFlag := C.int(0) // GOLLMGO_DTYPE_FP16
 	if meta.Dtype == "bf16" || meta.Dtype == "BF16" || meta.Dtype == "bfloat16" {
 		dtypeFlag = C.int(1) // GOLLMGO_DTYPE_BF16
+	}
+
+	quantFlag := C.int(0)
+	switch quantization {
+	case "fp8":
+		quantFlag = C.int(2) // GOLLMGO_DTYPE_FP8
+	case "int8":
+		quantFlag = C.int(3) // GOLLMGO_DTYPE_INT8
 	}
 
 	cfg := C.gollmgo_model_config_t{
@@ -42,6 +52,7 @@ func LoadModel(runner *CUDARunner, meta *model.ModelMeta, intermediateSize int) 
 		head_dim:          C.int(0),
 		rms_norm_eps:      C.float(1e-5),
 		dtype:             dtypeFlag,
+		quant_dtype:       quantFlag,
 	}
 
 	var handle C.gollmgo_model_t
@@ -169,6 +180,8 @@ func (m *CUDAModel) ForwardPaged(
 	if status != C.GOLLMGO_OK {
 		return nil, fmt.Errorf("cuda: forward_paged failed (status %d)", int(status))
 	}
+	// Sync graph cache stats to metrics.
+	m.SyncGraphStats()
 	return logits, nil
 }
 
@@ -390,6 +403,14 @@ func (r *CUDARunnerWithModel) extractLastTokenLogits(allLogits []float32, seqTok
 		tokenOffset += count
 	}
 	return out, nil
+}
+
+// SyncGraphStats updates Go-side graph cache metrics from the C model.
+func (m *CUDAModel) SyncGraphStats() {
+	var hits, lookups C.int64_t
+	C.gollmgo_model_graph_stats(m.handle, &hits, &lookups)
+	metrics.Global.GraphCacheHits.Store(int64(hits))
+	metrics.Global.GraphCacheLookups.Store(int64(lookups))
 }
 
 // Close releases the KV cache, model, and backend runner in reverse order.

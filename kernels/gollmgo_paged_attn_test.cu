@@ -216,9 +216,147 @@ void test_paged_vs_naive() {
     delete[] h_naive_last; delete[] h_paged_out;
 }
 
+/*
+ * Test: verify v2 (partitioned) produces the same output as v1
+ * for a long sequence that requires multiple partitions.
+ */
+void test_v2_vs_v1() {
+    printf("test_v2_vs_v1... ");
+
+    const int seq_len = 1024; /* >256 → multiple partitions */
+    const int num_heads = 4;
+    const int num_kv_heads = 2; /* GQA: 2 KV heads for 4 query heads */
+    const int head_dim = 64;
+    const int n_query = 1;
+    const int partition_size = PAGED_ATTN_V2_PARTITION_SIZE;
+    const float scale = 1.0f / sqrtf((float)head_dim);
+
+    srand(99);
+
+    int kv_entry = num_kv_heads * head_dim;
+    int q_total = n_query * num_heads * head_dim;
+
+    /* Random Q (for query token) and KV cache data. */
+    float* h_q_f32 = new float[q_total];
+    for (int i = 0; i < q_total; i++) h_q_f32[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.5f;
+
+    int cache_entries = seq_len * kv_entry;
+    float* h_k_f32 = new float[cache_entries];
+    float* h_v_f32 = new float[cache_entries];
+    for (int i = 0; i < cache_entries; i++) h_k_f32[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.5f;
+    for (int i = 0; i < cache_entries; i++) h_v_f32[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.5f;
+
+    /* Convert to FP16. */
+    __half* h_q = new __half[q_total];
+    __half* h_k = new __half[cache_entries];
+    __half* h_v = new __half[cache_entries];
+    for (int i = 0; i < q_total; i++) h_q[i] = __float2half(h_q_f32[i]);
+    for (int i = 0; i < cache_entries; i++) h_k[i] = __float2half(h_k_f32[i]);
+    for (int i = 0; i < cache_entries; i++) h_v[i] = __float2half(h_v_f32[i]);
+
+    /* GPU allocations. */
+    __half *d_q, *d_k_cache, *d_v_cache, *d_out_v1;
+    CHECK_CUDA(cudaMalloc(&d_q, q_total * sizeof(__half)));
+    CHECK_CUDA(cudaMalloc(&d_k_cache, cache_entries * sizeof(__half)));
+    CHECK_CUDA(cudaMalloc(&d_v_cache, cache_entries * sizeof(__half)));
+    CHECK_CUDA(cudaMalloc(&d_out_v1, q_total * sizeof(__half)));
+    CHECK_CUDA(cudaMemcpy(d_q, h_q, q_total * sizeof(__half), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_k_cache, h_k, cache_entries * sizeof(__half), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_v_cache, h_v, cache_entries * sizeof(__half), cudaMemcpyHostToDevice));
+
+    /* Slot table: identity mapping. */
+    int32_t* h_slot_table = new int32_t[seq_len];
+    for (int i = 0; i < seq_len; i++) h_slot_table[i] = i;
+    int32_t h_seq_len = seq_len;
+
+    int32_t *d_seq_lens, *d_slot_table;
+    CHECK_CUDA(cudaMalloc(&d_seq_lens, sizeof(int32_t)));
+    CHECK_CUDA(cudaMalloc(&d_slot_table, seq_len * sizeof(int32_t)));
+    CHECK_CUDA(cudaMemcpy(d_seq_lens, &h_seq_len, sizeof(int32_t), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_slot_table, h_slot_table, seq_len * sizeof(int32_t), cudaMemcpyHostToDevice));
+
+    /* ---- Run v1 ---- */
+    {
+        dim3 grid(1, num_heads);
+        int threads = 32;
+        int smem = seq_len * sizeof(float);
+        paged_attention_v1_f16<<<grid, threads, smem>>>(
+            d_q, d_k_cache, d_v_cache, d_out_v1,
+            d_seq_lens, d_slot_table,
+            1, num_heads, num_kv_heads, head_dim, seq_len, scale);
+        CHECK_CUDA(cudaDeviceSynchronize());
+    }
+
+    __half* h_out_v1 = new __half[q_total];
+    CHECK_CUDA(cudaMemcpy(h_out_v1, d_out_v1, q_total * sizeof(__half), cudaMemcpyDeviceToHost));
+
+    /* ---- Run v2 ---- */
+    int num_parts = (seq_len + partition_size - 1) / partition_size;
+    float *d_exp_sums, *d_max_logits, *d_partial_out, *d_reduce_out;
+    size_t scalar_sz = n_query * num_heads * num_parts * sizeof(float);
+    size_t vec_sz = (size_t)n_query * num_heads * num_parts * head_dim * sizeof(float);
+    size_t out_sz = n_query * num_heads * head_dim * sizeof(float);
+
+    CHECK_CUDA(cudaMalloc(&d_exp_sums, scalar_sz));
+    CHECK_CUDA(cudaMalloc(&d_max_logits, scalar_sz));
+    CHECK_CUDA(cudaMalloc(&d_partial_out, vec_sz));
+    CHECK_CUDA(cudaMalloc(&d_reduce_out, out_sz));
+
+    /* Phase 1. */
+    {
+        dim3 grid(1, num_heads, num_parts);
+        int threads = 32;
+        int smem = partition_size * sizeof(float);
+        paged_attention_v2_phase1_f16<<<grid, threads, smem>>>(
+            d_q, d_k_cache, d_v_cache,
+            d_exp_sums, d_max_logits, d_partial_out,
+            d_seq_lens, d_slot_table,
+            1, num_heads, num_kv_heads, head_dim, seq_len, scale, partition_size);
+        CHECK_CUDA(cudaDeviceSynchronize());
+    }
+
+    /* Phase 2: reduce. */
+    {
+        dim3 grid(1, num_heads);
+        int threads = 32;
+        int smem = num_parts * sizeof(float);
+        paged_attention_v2_reduce<<<grid, threads, smem>>>(
+            d_exp_sums, d_max_logits, d_partial_out, d_reduce_out,
+            d_seq_lens, 1, num_heads, head_dim, partition_size, num_parts);
+        CHECK_CUDA(cudaDeviceSynchronize());
+    }
+
+    float* h_out_v2_f32 = new float[n_query * num_heads * head_dim];
+    CHECK_CUDA(cudaMemcpy(h_out_v2_f32, d_reduce_out, out_sz, cudaMemcpyDeviceToHost));
+
+    /* ---- Compare ---- */
+    float max_diff = 0.0f;
+    for (int i = 0; i < q_total; i++) {
+        float v1_val = __half2float(h_out_v1[i]);
+        float v2_val = h_out_v2_f32[i];
+        float diff = fabsf(v1_val - v2_val);
+        if (diff > max_diff) max_diff = diff;
+        if (diff > 0.1f) {
+            fprintf(stderr, "FAIL v2_vs_v1[%d]: v1=%.4f v2=%.4f diff=%.4f\n",
+                    i, v1_val, v2_val, diff);
+            failures++;
+        }
+    }
+    printf("PASS (max_diff=%.4f, seq_len=%d, partitions=%d)\n", max_diff, seq_len, num_parts);
+
+    /* Cleanup. */
+    cudaFree(d_q); cudaFree(d_k_cache); cudaFree(d_v_cache); cudaFree(d_out_v1);
+    cudaFree(d_seq_lens); cudaFree(d_slot_table);
+    cudaFree(d_exp_sums); cudaFree(d_max_logits); cudaFree(d_partial_out); cudaFree(d_reduce_out);
+    delete[] h_q_f32; delete[] h_k_f32; delete[] h_v_f32;
+    delete[] h_q; delete[] h_k; delete[] h_v;
+    delete[] h_slot_table; delete[] h_out_v1; delete[] h_out_v2_f32;
+}
+
 int main() {
     printf("=== gollmgo paged attention correctness tests ===\n");
     test_paged_vs_naive();
+    test_v2_vs_v1();
     printf("=== %s (%d failures) ===\n", failures ? "FAILED" : "ALL PASSED", failures);
     return failures ? 1 : 0;
 }

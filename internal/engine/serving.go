@@ -17,13 +17,14 @@ import (
 // ServingEngine is the production engine that runs the continuous batching loop.
 // It owns the scheduler, KV cache, and coordinates the full serving pipeline.
 type ServingEngine struct {
-	runner    backend.Runner
-	sched     *scheduler.FCFSScheduler
-	cache     *kvcache.BlockPool
-	tokenizer model.Tokenizer
-	sampler   *Sampler
-	eosID     int32
-	log       *slog.Logger
+	runner      backend.Runner
+	sched       *scheduler.FCFSScheduler
+	cache       *kvcache.BlockPool
+	prefixCache *kvcache.PrefixCache // optional prefix caching for KV block reuse
+	tokenizer   model.Tokenizer
+	sampler     *Sampler
+	eosID       int32
+	log         *slog.Logger
 
 	preemptWatermark float64
 
@@ -46,6 +47,8 @@ type ServingEngineConfig struct {
 	// the engine preempts the longest decode sequence to free blocks.
 	// 0 disables preemption. Default: 0.95.
 	PreemptWatermark float64
+	// EnablePrefixCache enables block-level prefix caching for KV reuse.
+	EnablePrefixCache bool
 }
 
 // NewServingEngine creates the engine. Call Start to begin the batching loop.
@@ -53,10 +56,16 @@ func NewServingEngine(cfg ServingEngineConfig) *ServingEngine {
 	if cfg.PreemptWatermark <= 0 {
 		cfg.PreemptWatermark = 0.95
 	}
+	var prefixCache *kvcache.PrefixCache
+	if cfg.EnablePrefixCache {
+		prefixCache = kvcache.NewPrefixCache(cfg.Cache)
+	}
+
 	e := &ServingEngine{
 		runner:           cfg.Runner,
 		sched:            cfg.Scheduler,
 		cache:            cfg.Cache,
+		prefixCache:      prefixCache,
 		tokenizer:        cfg.Tokenizer,
 		sampler:          NewSampler(cfg.Sampling),
 		eosID:            cfg.Tokenizer.EOSTokenID(),
@@ -138,7 +147,31 @@ func (e *ServingEngine) runStep(ctx context.Context, schedOut *scheduler.Schedul
 		}
 
 		if isPrefill {
-			for i := 0; i < seq.PromptLen; i++ {
+			// Prefix cache: on first chunk, check for reusable prefix blocks.
+			if seq.PrefillConsumed == 0 && e.prefixCache != nil {
+				matched := bt.MatchPrefix(seq.TokenIDs[:seq.PromptLen], e.prefixCache)
+				if matched > 0 {
+					seq.PrefillConsumed = matched
+					// Emit slots for prefix-cached tokens into the batch
+					// so the model sees them in the slot mapping, but we
+					// don't need to run them through the kernel since
+					// KV is already in cache.
+				}
+			}
+
+			// Chunked prefill: process only a chunk of prompt tokens per step.
+			chunkSize := e.sched.PrefillChunkSize()
+			if chunkSize <= 0 {
+				chunkSize = seq.PromptLen // no chunking
+			}
+			start := seq.PrefillConsumed
+			remaining := seq.PromptLen - start
+			chunk := remaining
+			if chunk > chunkSize {
+				chunk = chunkSize
+			}
+
+			for i := start; i < start+chunk; i++ {
 				slot, err := bt.Append()
 				if err != nil {
 					e.mu.Unlock()
@@ -148,7 +181,8 @@ func (e *ServingEngine) runStep(ctx context.Context, schedOut *scheduler.Schedul
 				batch.Positions = append(batch.Positions, int32(i))
 				batch.SlotMapping = append(batch.SlotMapping, slot)
 			}
-			batch.SeqTokenCounts = append(batch.SeqTokenCounts, int32(seq.PromptLen))
+			seq.PrefillConsumed += chunk
+			batch.SeqTokenCounts = append(batch.SeqTokenCounts, int32(chunk))
 		} else {
 			slot, err := bt.Append()
 			if err != nil {
@@ -183,19 +217,25 @@ func (e *ServingEngine) runStep(ctx context.Context, schedOut *scheduler.Schedul
 			break
 		}
 
+		// For chunked prefill: skip sampling if prefill is not yet complete.
+		if seq.State == scheduler.SeqPrefilling && seq.PrefillConsumed < seq.PromptLen {
+			// Partial prefill chunk — no token to emit yet.
+			continue
+		}
+
 		tokenID := e.sampler.Sample(output.Logits[i])
 		now := time.Now()
 		seq.AppendToken(tokenID)
 		metrics.Global.TokensGenerated.Add(1)
 
 		if seq.State == scheduler.SeqPrefilling {
-			// Record TTFT: time from sequence creation to first token.
+			// Prefill complete — record TTFT and transition to decode.
 			ttftMs := float64(now.Sub(seq.CreatedAt).Microseconds()) / 1000.0
 			metrics.Global.TTFT.Record(ttftMs)
 			seq.Transition(scheduler.SeqDecoding)
 			seq.LastTokenAt = now
 		} else {
-			// Record ITL: time since last token for this sequence.
+			// Decode step — record ITL.
 			if !seq.LastTokenAt.IsZero() {
 				itlMs := float64(now.Sub(seq.LastTokenAt).Microseconds()) / 1000.0
 				metrics.Global.ITL.Record(itlMs)
@@ -351,6 +391,14 @@ func (e *ServingEngine) checkMemoryPressure() {
 
 func (e *ServingEngine) cleanupSequence(seqID uint64) {
 	if bt, ok := e.blockTables[seqID]; ok {
+		// Donate completed blocks to prefix cache before freeing.
+		if e.prefixCache != nil {
+			// We need the token IDs for hashing. Find them from the sequence
+			// which is still tracked by the scheduler at this point.
+			if seq := e.findSequence(seqID); seq != nil {
+				e.prefixCache.DonateBlocks(seq.TokenIDs[:seq.PromptLen], bt.PhysicalBlocks(), e.cache.BlockSize())
+			}
+		}
 		bt.Free()
 		delete(e.blockTables, seqID)
 	}
@@ -359,6 +407,12 @@ func (e *ServingEngine) cleanupSequence(seqID uint64) {
 		delete(e.subscribers, seqID)
 	}
 	e.sched.Complete(seqID)
+}
+
+// findSequence looks up a sequence by ID from the scheduler's tracked set.
+// Must be called with e.mu held.
+func (e *ServingEngine) findSequence(seqID uint64) *scheduler.Sequence {
+	return e.sched.Find(seqID)
 }
 
 // Compile-time check.

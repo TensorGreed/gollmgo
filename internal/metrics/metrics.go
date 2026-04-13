@@ -30,6 +30,11 @@ type Counters struct {
 	GraphCacheHits    atomic.Int64
 	GraphCacheLookups atomic.Int64
 
+	// Speculative decoding metrics.
+	SpecDraftTokens    atomic.Int64 // total draft tokens proposed
+	SpecAcceptedTokens atomic.Int64 // total accepted
+	SpecKillActive     atomic.Int64 // 1 if kill switch fired
+
 	// Latency histograms (server-side).
 	TTFT LatencyHistogram // time-to-first-token (prefill duration)
 	ITL  LatencyHistogram // inter-token latency (per decode step)
@@ -60,6 +65,15 @@ func (c *Counters) GraphCacheHitRate() float64 {
 		return 0
 	}
 	return float64(c.GraphCacheHits.Load()) / float64(lookups)
+}
+
+// SpecAcceptanceRate returns the speculative decode acceptance ratio.
+func (c *Counters) SpecAcceptanceRate() float64 {
+	drafted := c.SpecDraftTokens.Load()
+	if drafted == 0 {
+		return 0
+	}
+	return float64(c.SpecAcceptedTokens.Load()) / float64(drafted)
 }
 
 // Global is the process-wide metrics instance.

@@ -21,6 +21,8 @@ typedef struct gollmgo_model* gollmgo_model_t;
 /* Compute dtype constants. */
 #define GOLLMGO_DTYPE_FP16  0
 #define GOLLMGO_DTYPE_BF16  1
+#define GOLLMGO_DTYPE_FP8   2
+#define GOLLMGO_DTYPE_INT8  3
 
 /* Model architecture config. */
 typedef struct {
@@ -34,6 +36,7 @@ typedef struct {
     int head_dim;          /* hidden_size / num_heads */
     float rms_norm_eps;
     int dtype;             /* GOLLMGO_DTYPE_FP16 or GOLLMGO_DTYPE_BF16 */
+    int quant_dtype;       /* 0=none, GOLLMGO_DTYPE_FP8, GOLLMGO_DTYPE_INT8 — weight-only quantization */
 } gollmgo_model_config_t;
 
 /* Create a model with the given config. Allocates GPU memory for weights. */
@@ -126,6 +129,9 @@ gollmgo_status_t gollmgo_model_forward_paged(
     int max_context_len,
     const int32_t* seq_token_counts,
     float* logits_out);
+
+/* Query CUDA graph cache statistics. */
+void gollmgo_model_graph_stats(gollmgo_model_t m, int64_t* hits, int64_t* lookups);
 
 /* Destroy model and free all GPU memory. */
 gollmgo_status_t gollmgo_model_destroy(gollmgo_model_t m);

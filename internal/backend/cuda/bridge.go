@@ -77,10 +77,14 @@ func (r *CUDARunner) Step(_ context.Context, _ *backend.Batch) (*backend.StepOut
 }
 
 func (r *CUDARunner) Capabilities() backend.Capabilities {
+	// FP8 and INT8 require Blackwell or later (compute >= 12.0).
+	fp8 := r.info.ComputeMajor >= 12
 	return backend.Capabilities{
 		FP16:           true,
 		BF16:           true,
-		PagedAttention: false, // will be enabled in M6
+		FP8:            fp8,
+		INT8:           fp8, // INT8 also widely supported, gate same as FP8 for simplicity
+		PagedAttention: true,
 	}
 }
 

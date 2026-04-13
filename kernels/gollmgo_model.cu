@@ -14,6 +14,7 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <cuda_fp8.h>
 #include <cstring>
 #include <cstdio>
 #include <string>
@@ -36,6 +37,8 @@ struct gollmgo_model {
 
     /* Named weight tensors on device. */
     std::unordered_map<std::string, weight_tensor> weights;
+    /* Per-weight quantization scale factors (only when quant_dtype != 0). */
+    std::unordered_map<std::string, float> weight_scales;
 
     /* Scratch buffers.
      * buf_hidden is FP32 to prevent precision loss across layers.
@@ -53,6 +56,26 @@ struct gollmgo_model {
     void* buf_ffn_out;      /* [max_batch, hidden_size] */
     void* buf_logits_half;  /* [max_batch, vocab_size] — FP16 or BF16 */
     float*  buf_logits_f32; /* [max_batch, vocab_size] — device staging */
+
+    /* Pre-allocated decode input buffers (for graph capture — no cudaMalloc in hot path). */
+    int32_t* paged_d_token_ids;     /* [max_batch] */
+    int32_t* paged_d_positions;     /* [max_batch] */
+    int32_t* paged_d_slot_mapping;  /* [max_batch] */
+    int32_t* paged_d_seq_lens;      /* [max_batch] */
+    int32_t* paged_d_slot_tables;   /* [max_batch * max_seq_len] */
+
+    /* CUDA graph cache: batch_size → instantiated graph. */
+    std::unordered_map<int, cudaGraphExec_t> graph_cache;
+    int graph_max_context_len; /* max_context_len used during graph capture */
+    int64_t graph_hits;        /* graph replay count */
+    int64_t graph_lookups;     /* total forward_paged calls */
+
+    /* PagedAttention v2 scratch buffers. */
+    float* buf_v2_exp_sums;     /* [max_batch, num_heads, max_num_partitions] */
+    float* buf_v2_max_logits;   /* [max_batch, num_heads, max_num_partitions] */
+    float* buf_v2_partial_out;  /* [max_batch, num_heads, max_num_partitions, head_dim] */
+    float* buf_v2_reduce_out;   /* [max_batch, num_heads, head_dim] — FP32 reduce output */
+    int    max_num_partitions;
 
     int max_batch;
 };
@@ -137,13 +160,123 @@ static gollmgo_status_t gemm_bf16(gollmgo_model_t m,
     return GOLLMGO_OK;
 }
 
-/* Dispatch GEMM based on model dtype. */
+/* FP8 weight-only GEMM: A (activations) in BF16/FP16, B (weights) in FP8 E4M3. */
+static gollmgo_status_t gemm_fp8(gollmgo_model_t m,
+                                  const void* A, const void* B, void* C,
+                                  int M, int N, int K) {
+    float alpha = 1.0f;
+    float beta  = 0.0f;
+    cudaDataType_t a_type = (m->config.dtype == GOLLMGO_DTYPE_BF16) ? CUDA_R_16BF : CUDA_R_16F;
+    cudaDataType_t c_type = a_type;
+
+    cublasStatus_t status = cublasGemmEx(
+        m->cublas,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        N, M, K,
+        &alpha,
+        B, CUDA_R_8F_E4M3, K,
+        A, a_type, K,
+        &beta,
+        C, c_type, N,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT
+    );
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "cuBLAS GemmEx FP8 failed (status %d)", (int)status);
+        model_set_error(m, msg);
+        return GOLLMGO_ERR_INTERNAL;
+    }
+    return GOLLMGO_OK;
+}
+
+/* INT8 weight-only GEMM: A in BF16/FP16, B in INT8. */
+static gollmgo_status_t gemm_int8(gollmgo_model_t m,
+                                   const void* A, const void* B, void* C,
+                                   int M, int N, int K) {
+    float alpha = 1.0f;
+    float beta  = 0.0f;
+    cudaDataType_t a_type = (m->config.dtype == GOLLMGO_DTYPE_BF16) ? CUDA_R_16BF : CUDA_R_16F;
+    cudaDataType_t c_type = a_type;
+
+    cublasStatus_t status = cublasGemmEx(
+        m->cublas,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        N, M, K,
+        &alpha,
+        B, CUDA_R_8I, K,
+        A, a_type, K,
+        &beta,
+        C, c_type, N,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT
+    );
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "cuBLAS GemmEx INT8 failed (status %d)", (int)status);
+        model_set_error(m, msg);
+        return GOLLMGO_ERR_INTERNAL;
+    }
+    return GOLLMGO_OK;
+}
+
+/* Dispatch GEMM based on model dtype and quantization. */
 static gollmgo_status_t gemm(gollmgo_model_t m,
                               const void* A, const void* B, void* C,
                               int M, int N, int K) {
+    /* If weight-only quantization is active, use the quantized GEMM for weight (B). */
+    if (m->config.quant_dtype == GOLLMGO_DTYPE_FP8)
+        return gemm_fp8(m, A, B, C, M, N, K);
+    if (m->config.quant_dtype == GOLLMGO_DTYPE_INT8)
+        return gemm_int8(m, A, B, C, M, N, K);
     if (m->config.dtype == GOLLMGO_DTYPE_BF16)
         return gemm_bf16(m, A, B, C, M, N, K);
     return gemm_f16(m, A, B, C, M, N, K);
+}
+
+/* ---- Weight quantization kernels ---- */
+
+/* Quantize BF16 weights to FP8 E4M3 on device. */
+__global__ void quantize_to_fp8_kernel(const __nv_bfloat16* __restrict__ src,
+                                        __nv_fp8_storage_t* __restrict__ dst,
+                                        float scale_inv, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float val = __bfloat162float(src[idx]) * scale_inv;
+    dst[idx] = __nv_cvt_float_to_fp8(val, __NV_SATFINITE, __NV_E4M3);
+}
+
+/* Quantize BF16 weights to INT8. */
+__global__ void quantize_to_int8_kernel(const __nv_bfloat16* __restrict__ src,
+                                         int8_t* __restrict__ dst,
+                                         float scale_inv, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float val = __bfloat162float(src[idx]) * scale_inv;
+    int ival = __float2int_rn(val);
+    if (ival > 127) ival = 127;
+    if (ival < -127) ival = -127;
+    dst[idx] = (int8_t)ival;
+}
+
+/* Find absmax of a BF16 array (simple, not perf-critical — runs once at load). */
+__global__ void absmax_bf16_kernel(const __nv_bfloat16* __restrict__ src,
+                                    float* __restrict__ result, int n) {
+    __shared__ float shared_max[256];
+    float local_max = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = fabsf(__bfloat162float(src[i]));
+        if (v > local_max) local_max = v;
+    }
+    shared_max[threadIdx.x] = local_max;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float m = 0.0f;
+        for (int i = 0; i < blockDim.x && i < 256; i++) {
+            if (shared_max[i] > m) m = shared_max[i];
+        }
+        *result = m;
+    }
 }
 
 /* ---- Kernel dispatch macros ----
@@ -196,6 +329,19 @@ gollmgo_status_t gollmgo_model_create(gollmgo_backend_t b,
     m->buf_ffn_out = nullptr;
     m->buf_logits_half = nullptr;
     m->buf_logits_f32 = nullptr;
+    m->paged_d_token_ids = nullptr;
+    m->paged_d_positions = nullptr;
+    m->paged_d_slot_mapping = nullptr;
+    m->paged_d_seq_lens = nullptr;
+    m->paged_d_slot_tables = nullptr;
+    m->graph_max_context_len = 0;
+    m->graph_hits = 0;
+    m->graph_lookups = 0;
+    m->buf_v2_exp_sums = nullptr;
+    m->buf_v2_max_logits = nullptr;
+    m->buf_v2_partial_out = nullptr;
+    m->buf_v2_reduce_out = nullptr;
+    m->max_num_partitions = 0;
 
     cublasStatus_t cstat = cublasCreate(&m->cublas);
     if (cstat != CUBLAS_STATUS_SUCCESS) {
@@ -235,6 +381,56 @@ gollmgo_status_t gollmgo_model_load_weight(gollmgo_model_t m,
     }
 
     m->weights[name] = {dev_ptr, size_bytes};
+
+    /* If quantization is enabled, quantize linear weights (proj/gate/up/down/lm_head).
+     * Skip embedding and layernorm weights (they stay in native precision). */
+    if (m->config.quant_dtype != 0) {
+        std::string sname(name);
+        bool is_linear = (sname.find("_proj.weight") != std::string::npos) ||
+                         (sname.find("gate_proj.weight") != std::string::npos) ||
+                         (sname.find("up_proj.weight") != std::string::npos) ||
+                         (sname.find("down_proj.weight") != std::string::npos) ||
+                         (sname == "lm_head.weight");
+        if (is_linear && IS_BF16(m)) {
+            int num_elements = (int)(size_bytes / 2); /* BF16 = 2 bytes each */
+
+            /* Compute absmax. */
+            float* d_absmax;
+            cudaMalloc(&d_absmax, sizeof(float));
+            absmax_bf16_kernel<<<1, 256>>>((__nv_bfloat16*)dev_ptr, d_absmax, num_elements);
+            float h_absmax = 0;
+            cudaMemcpy(&h_absmax, d_absmax, sizeof(float), cudaMemcpyDeviceToHost);
+            cudaFree(d_absmax);
+
+            if (h_absmax > 0) {
+                int blocks = (num_elements + 255) / 256;
+                if (m->config.quant_dtype == GOLLMGO_DTYPE_FP8) {
+                    float scale = h_absmax / 448.0f;
+                    float scale_inv = 1.0f / scale;
+                    void* q_ptr;
+                    cudaMalloc(&q_ptr, num_elements); /* 1 byte per element */
+                    quantize_to_fp8_kernel<<<blocks, 256>>>(
+                        (__nv_bfloat16*)dev_ptr, (__nv_fp8_storage_t*)q_ptr, scale_inv, num_elements);
+                    cudaDeviceSynchronize();
+                    cudaFree(dev_ptr);
+                    m->weights[sname] = {q_ptr, (int64_t)num_elements};
+                    m->weight_scales[sname] = scale;
+                } else if (m->config.quant_dtype == GOLLMGO_DTYPE_INT8) {
+                    float scale = h_absmax / 127.0f;
+                    float scale_inv = 1.0f / scale;
+                    void* q_ptr;
+                    cudaMalloc(&q_ptr, num_elements);
+                    quantize_to_int8_kernel<<<blocks, 256>>>(
+                        (__nv_bfloat16*)dev_ptr, (int8_t*)q_ptr, scale_inv, num_elements);
+                    cudaDeviceSynchronize();
+                    cudaFree(dev_ptr);
+                    m->weights[sname] = {q_ptr, (int64_t)num_elements};
+                    m->weight_scales[sname] = scale;
+                }
+            }
+        }
+    }
+
     return GOLLMGO_OK;
 }
 
@@ -288,6 +484,43 @@ gollmgo_status_t gollmgo_model_ready(gollmgo_model_t m) {
     if (st != GOLLMGO_OK) return st;
 
     #undef ALLOC_BUF
+
+    /* Allocate PagedAttention v2 scratch buffers. */
+    {
+        int max_ctx = c.max_seq_len > 0 ? c.max_seq_len : 2048;
+        int part_size = PAGED_ATTN_V2_PARTITION_SIZE;
+        m->max_num_partitions = (max_ctx + part_size - 1) / part_size;
+        int mnp = m->max_num_partitions;
+        size_t scalar_size = (size_t)max_n * c.num_heads * mnp * sizeof(float);
+        size_t vec_size = (size_t)max_n * c.num_heads * mnp * c.head_dim * sizeof(float);
+        size_t reduce_size = (size_t)max_n * c.num_heads * c.head_dim * sizeof(float);
+
+        st = model_check_cuda(m, cudaMalloc((void**)&m->buf_v2_exp_sums, scalar_size));
+        if (st != GOLLMGO_OK) return st;
+        st = model_check_cuda(m, cudaMalloc((void**)&m->buf_v2_max_logits, scalar_size));
+        if (st != GOLLMGO_OK) return st;
+        st = model_check_cuda(m, cudaMalloc((void**)&m->buf_v2_partial_out, vec_size));
+        if (st != GOLLMGO_OK) return st;
+        st = model_check_cuda(m, cudaMalloc((void**)&m->buf_v2_reduce_out, reduce_size));
+        if (st != GOLLMGO_OK) return st;
+    }
+
+    /* Pre-allocate decode input buffers (eliminates cudaMalloc from hot path). */
+    {
+        int max_ctx = c.max_seq_len > 0 ? c.max_seq_len : 2048;
+        st = model_check_cuda(m, cudaMalloc((void**)&m->paged_d_token_ids, max_n * sizeof(int32_t)));
+        if (st != GOLLMGO_OK) return st;
+        st = model_check_cuda(m, cudaMalloc((void**)&m->paged_d_positions, max_n * sizeof(int32_t)));
+        if (st != GOLLMGO_OK) return st;
+        st = model_check_cuda(m, cudaMalloc((void**)&m->paged_d_slot_mapping, max_n * sizeof(int32_t)));
+        if (st != GOLLMGO_OK) return st;
+        st = model_check_cuda(m, cudaMalloc((void**)&m->paged_d_seq_lens, max_n * sizeof(int32_t)));
+        if (st != GOLLMGO_OK) return st;
+        st = model_check_cuda(m, cudaMalloc((void**)&m->paged_d_slot_tables,
+                                             (size_t)max_n * max_ctx * sizeof(int32_t)));
+        if (st != GOLLMGO_OK) return st;
+        m->graph_max_context_len = max_ctx;
+    }
 
     m->ready = true;
     return GOLLMGO_OK;
@@ -372,24 +605,65 @@ static gollmgo_status_t run_layer(gollmgo_model_t m, int layer, int N,
 
     /* Attention. */
     if (paged_decode && kv_cache) {
-        /* Paged attention for decode. */
         void* lk = gollmgo_kvcache_k_layer_ptr(kv_cache, layer);
         void* lv = gollmgo_kvcache_v_layer_ptr(kv_cache, layer);
-        dim3 grid(N, c.num_heads);
+        float attn_scale = 1.0f / sqrtf((float)c.head_dim);
         int threads = (c.head_dim < 32) ? c.head_dim : 32;
-        int smem = max_context_len * sizeof(float);
-        if (bf16)
-            paged_attention_v1_bf16<<<grid, threads, smem>>>(
-                AS_CBF16(m->buf_q), AS_CBF16(lk), AS_CBF16(lv), AS_BF16(m->buf_attn_out),
-                d_seq_lens, d_slot_tables,
-                N, c.num_heads, c.num_kv_heads, c.head_dim,
-                max_context_len, 1.0f / sqrtf((float)c.head_dim));
-        else
-            paged_attention_v1_f16<<<grid, threads, smem>>>(
-                AS_CF16(m->buf_q), AS_CF16(lk), AS_CF16(lv), AS_F16(m->buf_attn_out),
-                d_seq_lens, d_slot_tables,
-                N, c.num_heads, c.num_kv_heads, c.head_dim,
-                max_context_len, 1.0f / sqrtf((float)c.head_dim));
+        int part_size = PAGED_ATTN_V2_PARTITION_SIZE;
+        int num_parts = (max_context_len + part_size - 1) / part_size;
+
+        if (num_parts <= 1) {
+            /* Short context — use v1 (no partition overhead). */
+            int smem = max_context_len * sizeof(float);
+            if (bf16)
+                paged_attention_v1_bf16<<<dim3(N, c.num_heads), threads, smem>>>(
+                    AS_CBF16(m->buf_q), AS_CBF16(lk), AS_CBF16(lv), AS_BF16(m->buf_attn_out),
+                    d_seq_lens, d_slot_tables,
+                    N, c.num_heads, c.num_kv_heads, c.head_dim,
+                    max_context_len, attn_scale);
+            else
+                paged_attention_v1_f16<<<dim3(N, c.num_heads), threads, smem>>>(
+                    AS_CF16(m->buf_q), AS_CF16(lk), AS_CF16(lv), AS_F16(m->buf_attn_out),
+                    d_seq_lens, d_slot_tables,
+                    N, c.num_heads, c.num_kv_heads, c.head_dim,
+                    max_context_len, attn_scale);
+        } else {
+            /* Long context — use v2 (partitioned). */
+            dim3 grid1(N, c.num_heads, num_parts);
+            int smem1 = part_size * sizeof(float);
+            if (bf16)
+                paged_attention_v2_phase1_bf16<<<grid1, threads, smem1>>>(
+                    AS_CBF16(m->buf_q), AS_CBF16(lk), AS_CBF16(lv),
+                    m->buf_v2_exp_sums, m->buf_v2_max_logits, m->buf_v2_partial_out,
+                    d_seq_lens, d_slot_tables,
+                    N, c.num_heads, c.num_kv_heads, c.head_dim,
+                    max_context_len, attn_scale, part_size);
+            else
+                paged_attention_v2_phase1_f16<<<grid1, threads, smem1>>>(
+                    AS_CF16(m->buf_q), AS_CF16(lk), AS_CF16(lv),
+                    m->buf_v2_exp_sums, m->buf_v2_max_logits, m->buf_v2_partial_out,
+                    d_seq_lens, d_slot_tables,
+                    N, c.num_heads, c.num_kv_heads, c.head_dim,
+                    max_context_len, attn_scale, part_size);
+
+            /* Phase 2: reduce partitions → FP32 output. */
+            dim3 grid2(N, c.num_heads);
+            int smem2 = num_parts * sizeof(float);
+            paged_attention_v2_reduce<<<grid2, threads, smem2>>>(
+                m->buf_v2_exp_sums, m->buf_v2_max_logits, m->buf_v2_partial_out,
+                m->buf_v2_reduce_out,
+                d_seq_lens, N, c.num_heads, c.head_dim, part_size, num_parts);
+
+            /* Convert FP32 reduce output → half-precision attn_out for o_proj GEMM. */
+            int total = N * c.num_heads * c.head_dim;
+            int cvt_blocks = (total + 255) / 256;
+            if (bf16)
+                f32_to_bf16<<<cvt_blocks, 256>>>(m->buf_v2_reduce_out,
+                    AS_BF16(m->buf_attn_out), total);
+            else
+                f32_to_f16<<<cvt_blocks, 256>>>(m->buf_v2_reduce_out,
+                    AS_F16(m->buf_attn_out), total);
+        }
     } else {
         /* Naive (eager) attention. */
         dim3 grid(N, c.num_heads);
@@ -513,7 +787,8 @@ static void run_embedding(gollmgo_model_t m, int32_t* d_token_ids, int N) {
             d_token_ids, m->buf_hidden, c.hidden_size, c.vocab_size);
 }
 
-static gollmgo_status_t run_lm_head(gollmgo_model_t m, int N, float* host_logits_out) {
+/* Compute LM head on device — logits end up in m->buf_logits_f32. */
+static gollmgo_status_t run_lm_head_device(gollmgo_model_t m, int N) {
     auto& c = m->config;
     bool bf16 = IS_BF16(m);
     gollmgo_status_t st;
@@ -536,7 +811,7 @@ static gollmgo_status_t run_lm_head(gollmgo_model_t m, int N, float* host_logits
               N, c.vocab_size, c.hidden_size);
     if (st != GOLLMGO_OK) return st;
 
-    /* Convert to F32. */
+    /* Convert to F32 on device. */
     {
         int total = N * c.vocab_size;
         int threads = 256;
@@ -548,12 +823,17 @@ static gollmgo_status_t run_lm_head(gollmgo_model_t m, int N, float* host_logits
             f16_to_f32<<<blocks, threads>>>(AS_CF16(m->buf_logits_half),
                 m->buf_logits_f32, total);
     }
+    return GOLLMGO_OK;
+}
 
-    st = model_check_cuda(m, cudaMemcpy(
+/* Compute + copy logits to host. */
+static gollmgo_status_t run_lm_head(gollmgo_model_t m, int N, float* host_logits_out) {
+    gollmgo_status_t st = run_lm_head_device(m, N);
+    if (st != GOLLMGO_OK) return st;
+    return model_check_cuda(m, cudaMemcpy(
         host_logits_out, m->buf_logits_f32,
-        N * c.vocab_size * sizeof(float),
+        N * m->config.vocab_size * sizeof(float),
         cudaMemcpyDeviceToHost));
-    return st;
 }
 
 /* ---- Forward pass implementations ---- */
@@ -678,44 +958,91 @@ gollmgo_status_t gollmgo_model_forward_paged(
     int N = n_tokens;
     gollmgo_status_t st;
 
-    int32_t *d_token_ids = nullptr, *d_positions = nullptr, *d_slot_mapping = nullptr;
-    int32_t *d_seq_lens = nullptr, *d_slot_tables = nullptr;
+    /* Use pre-allocated buffers (no cudaMalloc in hot path).
+     * Pad max_context_len to the graph-captured size for graph replay compatibility. */
+    int padded_ctx = max_context_len;
+    if (padded_ctx > m->graph_max_context_len) {
+        padded_ctx = m->graph_max_context_len;
+    }
 
-    st = model_check_cuda(m, cudaMalloc((void**)&d_token_ids, N * sizeof(int32_t)));
-    if (st != GOLLMGO_OK) return st;
-    st = model_check_cuda(m, cudaMalloc((void**)&d_positions, N * sizeof(int32_t)));
-    if (st != GOLLMGO_OK) goto cleanup;
-    st = model_check_cuda(m, cudaMalloc((void**)&d_slot_mapping, N * sizeof(int32_t)));
-    if (st != GOLLMGO_OK) goto cleanup;
-    st = model_check_cuda(m, cudaMalloc((void**)&d_seq_lens, N * sizeof(int32_t)));
-    if (st != GOLLMGO_OK) goto cleanup;
-    st = model_check_cuda(m, cudaMalloc((void**)&d_slot_tables, (size_t)N * max_context_len * sizeof(int32_t)));
-    if (st != GOLLMGO_OK) goto cleanup;
+    int32_t* d_token_ids = m->paged_d_token_ids;
+    int32_t* d_positions = m->paged_d_positions;
+    int32_t* d_slot_mapping = m->paged_d_slot_mapping;
+    int32_t* d_seq_lens = m->paged_d_seq_lens;
+    int32_t* d_slot_tables = m->paged_d_slot_tables;
 
     cudaMemcpy(d_token_ids, host_token_ids, N * sizeof(int32_t), cudaMemcpyHostToDevice);
     cudaMemcpy(d_positions, host_positions, N * sizeof(int32_t), cudaMemcpyHostToDevice);
     cudaMemcpy(d_slot_mapping, host_slot_mapping, N * sizeof(int32_t), cudaMemcpyHostToDevice);
     cudaMemcpy(d_seq_lens, host_seq_lens, N * sizeof(int32_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_slot_tables, host_slot_tables, (size_t)N * max_context_len * sizeof(int32_t), cudaMemcpyHostToDevice);
-
-    run_embedding(m, d_token_ids, N);
-
-    for (int layer = 0; layer < m->config.num_layers; layer++) {
-        st = run_layer(m, layer, N, d_positions,
-                       d_slot_mapping, kv_cache,
-                       d_seq_lens, d_slot_tables, max_context_len, true);
-        if (st != GOLLMGO_OK) goto cleanup;
+    /* Copy slot tables into the pre-allocated buffer padded to graph_max_context_len. */
+    if (max_context_len <= m->graph_max_context_len) {
+        cudaMemcpy(d_slot_tables, host_slot_tables,
+                   (size_t)N * max_context_len * sizeof(int32_t), cudaMemcpyHostToDevice);
+    } else {
+        /* Truncate — shouldn't happen in practice. */
+        cudaMemcpy(d_slot_tables, host_slot_tables,
+                   (size_t)N * m->graph_max_context_len * sizeof(int32_t), cudaMemcpyHostToDevice);
     }
 
-    st = run_lm_head(m, N, host_logits_out);
+    /* Check for cached CUDA graph. */
+    m->graph_lookups++;
+    auto it = m->graph_cache.find(N);
+    if (it != m->graph_cache.end() && max_context_len <= m->graph_max_context_len) {
+        /* Graph replay — skip kernel launches, just replay the captured graph. */
+        m->graph_hits++;
+        cudaGraphLaunch(it->second, 0 /* default stream */);
+        cudaStreamSynchronize(0);
+    } else {
+        /* Eager path (also used for graph capture). */
+        bool should_capture = (it == m->graph_cache.end()) &&
+                              (N <= 64) && /* only cache common decode batch sizes */
+                              (max_context_len <= m->graph_max_context_len);
+        cudaGraph_t graph = nullptr;
+        if (should_capture) {
+            cudaStreamBeginCapture(0, cudaStreamCaptureModeRelaxed);
+        }
 
-cleanup:
-    cudaFree(d_token_ids);
-    cudaFree(d_positions);
-    cudaFree(d_slot_mapping);
-    cudaFree(d_seq_lens);
-    cudaFree(d_slot_tables);
+        run_embedding(m, d_token_ids, N);
+
+        for (int layer = 0; layer < m->config.num_layers; layer++) {
+            st = run_layer(m, layer, N, d_positions,
+                           d_slot_mapping, kv_cache,
+                           d_seq_lens, d_slot_tables, max_context_len, true);
+            if (st != GOLLMGO_OK) {
+                if (should_capture) cudaStreamEndCapture(0, &graph);
+                if (graph) cudaGraphDestroy(graph);
+                return st;
+            }
+        }
+
+        run_lm_head_device(m, N);
+
+        if (should_capture) {
+            cudaStreamEndCapture(0, &graph);
+            if (graph) {
+                cudaGraphExec_t exec = nullptr;
+                if (cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0) == cudaSuccess && exec) {
+                    m->graph_cache[N] = exec;
+                }
+                cudaGraphDestroy(graph);
+            }
+        }
+    }
+
+    /* Copy logits to host. */
+    st = model_check_cuda(m, cudaMemcpy(
+        host_logits_out, m->buf_logits_f32,
+        N * m->config.vocab_size * sizeof(float),
+        cudaMemcpyDeviceToHost));
+
     return st;
+}
+
+void gollmgo_model_graph_stats(gollmgo_model_t m, int64_t* hits, int64_t* lookups) {
+    if (!m) { *hits = 0; *lookups = 0; return; }
+    *hits = m->graph_hits;
+    *lookups = m->graph_lookups;
 }
 
 gollmgo_status_t gollmgo_model_destroy(gollmgo_model_t m) {
@@ -738,6 +1065,20 @@ gollmgo_status_t gollmgo_model_destroy(gollmgo_model_t m) {
     cudaFree(m->buf_ffn_out);
     cudaFree(m->buf_logits_half);
     cudaFree(m->buf_logits_f32);
+    cudaFree(m->paged_d_token_ids);
+    cudaFree(m->paged_d_positions);
+    cudaFree(m->paged_d_slot_mapping);
+    cudaFree(m->paged_d_seq_lens);
+    cudaFree(m->paged_d_slot_tables);
+    cudaFree(m->buf_v2_exp_sums);
+    cudaFree(m->buf_v2_max_logits);
+    cudaFree(m->buf_v2_partial_out);
+    cudaFree(m->buf_v2_reduce_out);
+
+    /* Destroy cached CUDA graphs. */
+    for (auto& kv : m->graph_cache) {
+        cudaGraphExecDestroy(kv.second);
+    }
 
     if (m->cublas) {
         cublasDestroy(m->cublas);

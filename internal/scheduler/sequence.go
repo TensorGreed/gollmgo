@@ -38,7 +38,7 @@ func (s SeqState) String() string {
 // Valid state transitions.
 var validTransitions = map[SeqState][]SeqState{
 	SeqWaiting:    {SeqPrefilling},
-	SeqPrefilling: {SeqDecoding},
+	SeqPrefilling: {SeqPrefilling, SeqDecoding}, // self-transition for chunked prefill
 	SeqDecoding:   {SeqFinished, SeqPreempted},
 	SeqPreempted:  {SeqWaiting},
 	// SeqFinished is terminal.
@@ -66,6 +66,9 @@ type Sequence struct {
 	GeneratedLen int
 	MaxTokens    int
 	TokenIDs     []int32 // prompt + generated so far
+
+	// Chunked prefill tracking.
+	PrefillConsumed int // how many prompt tokens have been processed so far
 
 	// Timestamps for latency metrics.
 	CreatedAt     time.Time // when the sequence was created (for TTFT)
