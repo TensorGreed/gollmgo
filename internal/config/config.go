@@ -10,8 +10,20 @@ type Config struct {
 	Port int    `json:"port"`
 
 	// Model settings.
+	//
+	// ModelPath accepts either a local filesystem path (to a directory or a
+	// single .safetensors file) OR a HuggingFace Hub repo id of the form
+	// "owner/name[@revision]". HF repos are auto-downloaded to the cache
+	// directory; see also HFCacheDir and HFToken.
 	ModelPath     string `json:"model_path"`
 	TokenizerPath string `json:"tokenizer_path"`
+	// HFCacheDir overrides the default HF download cache. When empty the
+	// resolver honors $GOLLMGO_CACHE_DIR, then $XDG_CACHE_HOME, then
+	// ~/.cache/gollmgo/hub.
+	HFCacheDir string `json:"hf_cache_dir"`
+	// HFToken is the HuggingFace bearer token used for gated/private repos.
+	// When empty the resolver checks $HF_TOKEN / $HUGGING_FACE_HUB_TOKEN.
+	HFToken string `json:"hf_token"`
 
 	// Scheduler settings.
 	MaxBatchSize     int    `json:"max_batch_size"`

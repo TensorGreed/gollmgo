@@ -104,6 +104,74 @@ func LoadSafetensorsWeights(path string) ([]WeightTensor, *ModelMeta, error) {
 	return tensors, meta, nil
 }
 
+// LoadSafetensorsDirectory loads weights from one or more .safetensors
+// files in a directory. Handles the common HF layouts:
+//
+//   - single file: model.safetensors
+//   - sharded:     model-00001-of-0000N.safetensors, ..., optional model.safetensors.index.json
+//
+// The index file is not required — we simply iterate every .safetensors
+// file in the directory and merge the tensors. Duplicate tensor names
+// across shards are unexpected and the second definition wins.
+func LoadSafetensorsDirectory(dir string) ([]WeightTensor, *ModelMeta, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, nil, fmt.Errorf("safetensors dir: readdir %s: %w", dir, err)
+	}
+
+	var shards []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if len(e.Name()) >= len(".safetensors") &&
+			e.Name()[len(e.Name())-len(".safetensors"):] == ".safetensors" {
+			shards = append(shards, e.Name())
+		}
+	}
+	if len(shards) == 0 {
+		return nil, nil, fmt.Errorf("safetensors dir: no .safetensors files in %s", dir)
+	}
+	// Sort for deterministic load order.
+	sortStrings(shards)
+
+	var all []WeightTensor
+	meta := &ModelMeta{Dtype: "unknown"}
+	for _, name := range shards {
+		path := dir + string(os.PathSeparator) + name
+		tensors, m, err := LoadSafetensorsWeights(path)
+		if err != nil {
+			return nil, nil, fmt.Errorf("safetensors dir: %s: %w", name, err)
+		}
+		all = append(all, tensors...)
+		// First shard that resolves these fields wins.
+		if meta.Family == "" && m.Family != "" {
+			meta.Family = m.Family
+		}
+		if meta.VocabSize == 0 && m.VocabSize > 0 {
+			meta.VocabSize = m.VocabSize
+		}
+		if meta.HiddenSize == 0 && m.HiddenSize > 0 {
+			meta.HiddenSize = m.HiddenSize
+		}
+		if meta.Dtype == "unknown" && m.Dtype != "unknown" && m.Dtype != "" {
+			meta.Dtype = m.Dtype
+		}
+	}
+	meta.NumLayers = countLayersFromTensors(all)
+	return all, meta, nil
+}
+
+// sortStrings is a tiny inline sort to avoid importing "sort" just for
+// this one call; safetensors dirs have small shard counts.
+func sortStrings(xs []string) {
+	for i := 1; i < len(xs); i++ {
+		for j := i; j > 0 && xs[j-1] > xs[j]; j-- {
+			xs[j-1], xs[j] = xs[j], xs[j-1]
+		}
+	}
+}
+
 func countLayersFromTensors(tensors []WeightTensor) int {
 	maxLayer := -1
 	for _, t := range tensors {

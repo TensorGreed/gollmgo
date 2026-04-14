@@ -8,8 +8,10 @@ import (
 	"os"
 )
 
-// GGUFLoader loads model metadata from GGUF format files.
-// Full weight loading deferred to M5; this extracts the header metadata.
+// GGUFLoader reads the GGUF header (magic, version, KV metadata, tensor
+// directory). LoadGGUFWeights below reads the tensor data itself for the
+// floating-point dtypes (F32, F16, BF16). Quantized GGUF dtypes (Q4_0,
+// Q5_K, etc.) are not currently supported.
 
 // GGUF magic number: "GGUF" in little-endian.
 const ggufMagic = 0x46475547 // "GGUF" LE

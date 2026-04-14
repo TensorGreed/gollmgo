@@ -13,18 +13,23 @@ type ModelEntry struct {
 	ID      string `json:"id"`
 	Object  string `json:"object"`
 	OwnedBy string `json:"owned_by"`
+	// Created is a unix timestamp; OpenAI clients expect it.
+	Created int64 `json:"created"`
 }
 
-// ModelsHandler returns the list of loaded models.
-// For now returns a hardcoded placeholder; wired to real model registry later.
+// ModelsHandler returns the list of loaded models. The server reports the
+// actual model id derived from the loaded weights (or "mock" in dev mode).
+// gollmgo currently serves a single model per process; the response is a
+// list with one entry to match the OpenAI schema.
 func (s *Server) ModelsHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		resp := ModelsResponse{
 			Object: "list",
 			Data: []ModelEntry{{
-				ID:      "gollmgo-default",
+				ID:      s.modelID,
 				Object:  "model",
 				OwnedBy: "local",
+				Created: s.startedUnix,
 			}},
 		}
 		writeJSON(w, http.StatusOK, resp)

@@ -13,6 +13,8 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"syscall"
@@ -24,6 +26,7 @@ import (
 	"github.com/TensorGreed/gollmgo/internal/engine"
 	"github.com/TensorGreed/gollmgo/internal/kvcache"
 	"github.com/TensorGreed/gollmgo/internal/model"
+	"github.com/TensorGreed/gollmgo/internal/model/hfhub"
 	"github.com/TensorGreed/gollmgo/internal/scheduler"
 )
 
@@ -98,14 +101,28 @@ func cmdServe(args []string) {
 	var tokenizer model.Tokenizer
 
 	numBlocks := 1024 // default for mock mode
+	modelID := "mock"
 	if cfg.ModelPath != "" {
-		var err error
-		runner, tokenizer, numBlocks, err = initGPURunner(log, cfg, *deviceID)
+		resolveCtx, resolveCancel := context.WithCancel(context.Background())
+		handle, err := resolveModelSpec(resolveCtx, log, cfg)
+		resolveCancel()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "model resolution failed: %v\n", err)
+			os.Exit(1)
+		}
+
+		runner, tokenizer, numBlocks, err = initGPURunner(log, cfg, handle, *deviceID)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "GPU init failed: %v\n", err)
 			os.Exit(1)
 		}
-		log.Info("GPU model loaded", "model", cfg.ModelPath)
+		if handle.RepoID != "" {
+			log.Info("GPU model loaded", "repo", handle.RepoID, "revision", handle.Revision, "dir", handle.LocalDir)
+			modelID = handle.RepoID
+		} else {
+			log.Info("GPU model loaded", "model", handle.LocalDir)
+			modelID = modelIDFromPath(cfg.ModelPath)
+		}
 	} else {
 		log.Info("no --model provided, using mock runner (development mode)")
 		runner = &backend.MockRunner{}
@@ -159,7 +176,7 @@ func cmdServe(args []string) {
 	eng.Start(ctx)
 
 	// Create and start API server.
-	srv := api.NewServer(cfg, eng, tokenizer, log)
+	srv := api.NewServer(cfg, eng, tokenizer, log, modelID)
 
 	// Graceful shutdown.
 	sigCh := make(chan os.Signal, 1)
@@ -557,6 +574,61 @@ func saveBenchResult(result BenchResult, data []byte) {
 	os.WriteFile(filename, data, 0644)
 }
 
+// modelIDFromPath derives the API model id from --model. Examples:
+//
+//	/models/Llama-3-8B-Instruct/                  -> "Llama-3-8B-Instruct"
+//	/models/Llama-3-8B-Instruct/model.safetensors -> "Llama-3-8B-Instruct"
+//	/models/llama.gguf                            -> "llama.gguf"
+//
+// Falls back to "gollmgo-default" if the input is empty.
+func modelIDFromPath(p string) string {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return "gollmgo-default"
+	}
+	clean := strings.TrimRight(p, "/")
+	// If --model points at a single file inside a model directory, prefer
+	// the directory name (matches typical HF layouts).
+	if info, err := os.Stat(clean); err == nil && !info.IsDir() {
+		dir := filepath.Dir(clean)
+		base := filepath.Base(dir)
+		if base != "" && base != "." && base != "/" {
+			return base
+		}
+	}
+	base := filepath.Base(clean)
+	if base == "" || base == "." || base == "/" {
+		return "gollmgo-default"
+	}
+	return base
+}
+
+// resolveModelSpec parses cfg.ModelPath as either a local path or an
+// HF Hub repo id ("owner/name[@revision]") and makes the files available
+// locally, downloading to the HF cache if needed. Returns a Handle that
+// initGPURunner consumes.
+func resolveModelSpec(ctx context.Context, log *slog.Logger, cfg config.Config) (*hfhub.Handle, error) {
+	spec, err := hfhub.ParseSpec(cfg.ModelPath)
+	if err != nil {
+		return nil, err
+	}
+	token := cfg.HFToken
+	if token == "" {
+		token = hfhub.TokenFromEnv()
+	}
+	resolver := &hfhub.Resolver{
+		CacheDir: cfg.HFCacheDir, // empty → resolver picks default
+		Token:    token,
+		Log:      log,
+	}
+	if !spec.IsLocal {
+		log.Info("resolving HuggingFace repo",
+			"repo", spec.Repo, "revision", spec.Revision,
+			"token_set", token != "")
+	}
+	return resolver.Resolve(ctx, spec)
+}
+
 func schedulerPolicyFromString(s string) scheduler.Policy {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "sjf":
@@ -577,12 +649,225 @@ func preemptModeFromString(s string) scheduler.PreemptMode {
 	}
 }
 
-func cmdDoctor(_ []string) {
+// doctorCheck is one diagnostic. status is "PASS", "WARN", or "FAIL".
+type doctorCheck struct {
+	name   string
+	status string
+	detail string
+}
+
+func cmdDoctor(args []string) {
+	fs := flag.NewFlagSet("doctor", flag.ExitOnError)
+	configPath := fs.String("config", "", "path to server config to validate")
+	modelPath := fs.String("model", "", "path to model file or directory to probe")
+	fs.Parse(args)
+
+	checks := []doctorCheck{
+		runtimeCheck(),
+		binaryCheck(),
+		nvidiaDriverCheck(),
+		nvccCheck(),
+		configCheck(*configPath),
+	}
+	if *modelPath != "" {
+		checks = append(checks, modelCheck(*modelPath))
+	} else {
+		checks = append(checks, doctorCheck{
+			name: "Model", status: "WARN",
+			detail: "no --model provided; doctor only validates the toolchain",
+		})
+	}
+
 	fmt.Println("gollmgo doctor")
-	fmt.Println("  Go version: runtime check")
-	fmt.Println("  Config: valid defaults")
-	fmt.Println("  GPU: check via build tag")
-	fmt.Println("doctor: all checks passed (stub)")
+	fmt.Println()
+	pass, warn, fail := 0, 0, 0
+	for _, c := range checks {
+		fmt.Printf("  %-20s [%s] %s\n", c.name, c.status, c.detail)
+		switch c.status {
+		case "PASS":
+			pass++
+		case "WARN":
+			warn++
+		case "FAIL":
+			fail++
+		}
+	}
+	fmt.Println()
+	fmt.Printf("  summary: %d pass, %d warn, %d fail\n", pass, warn, fail)
+	if fail > 0 {
+		os.Exit(1)
+	}
+}
+
+func runtimeCheck() doctorCheck {
+	return doctorCheck{
+		name:   "Go runtime",
+		status: "PASS",
+		detail: fmt.Sprintf("%s on %s/%s", runtime.Version(), runtime.GOOS, runtime.GOARCH),
+	}
+}
+
+func binaryCheck() doctorCheck {
+	bin := "bin/gollmgo"
+	info, err := os.Stat(bin)
+	if err != nil {
+		return doctorCheck{
+			name: "Binary", status: "WARN",
+			detail: bin + " not found — run `make build` to produce a GPU-enabled binary",
+		}
+	}
+	return doctorCheck{
+		name: "Binary", status: "PASS",
+		detail: fmt.Sprintf("%s present (%.1f MB)", bin, float64(info.Size())/(1<<20)),
+	}
+}
+
+func nvidiaDriverCheck() doctorCheck {
+	out, err := exec.Command("nvidia-smi", "--query-gpu=name,driver_version,memory.total",
+		"--format=csv,noheader").Output()
+	if err != nil {
+		return doctorCheck{
+			name: "NVIDIA driver", status: "FAIL",
+			detail: "nvidia-smi failed (" + err.Error() + ") — driver not installed or no GPU visible",
+		}
+	}
+	first := strings.SplitN(strings.TrimSpace(string(out)), "\n", 2)[0]
+	return doctorCheck{
+		name:   "NVIDIA driver",
+		status: "PASS",
+		detail: first,
+	}
+}
+
+func nvccCheck() doctorCheck {
+	path, err := exec.LookPath("nvcc")
+	if err != nil {
+		return doctorCheck{
+			name: "CUDA toolkit", status: "WARN",
+			detail: "nvcc not on PATH — needed for `make kernels` (runtime serving uses precompiled .a files)",
+		}
+	}
+	out, err := exec.Command("nvcc", "--version").Output()
+	if err != nil {
+		return doctorCheck{
+			name: "CUDA toolkit", status: "WARN", detail: "nvcc found at " + path + " but failed: " + err.Error(),
+		}
+	}
+	// Last line of `nvcc --version` looks like: "Build cuda_12.x.r12.x/compiler.xxxxx_0"
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	return doctorCheck{
+		name: "CUDA toolkit", status: "PASS", detail: lines[len(lines)-1],
+	}
+}
+
+func configCheck(path string) doctorCheck {
+	cfg := config.DefaultConfig()
+	if path != "" {
+		loaded, err := config.LoadFile(path)
+		if err != nil {
+			return doctorCheck{
+				name: "Config", status: "FAIL",
+				detail: fmt.Sprintf("load %s: %v", path, err),
+			}
+		}
+		cfg = loaded
+	}
+	if err := cfg.Validate(); err != nil {
+		return doctorCheck{
+			name: "Config", status: "FAIL", detail: err.Error(),
+		}
+	}
+	source := "default"
+	if path != "" {
+		source = path
+	}
+	return doctorCheck{
+		name:   "Config",
+		status: "PASS",
+		detail: fmt.Sprintf("%s validates (policy=%s preempt=%s prefix_chunk=%d)",
+			source, cfg.SchedulerPolicy, cfg.PreemptMode, cfg.PrefillChunkSize),
+	}
+}
+
+// modelCheck does a cheap structural probe of the model spec. It accepts
+// either a local path or an HF Hub repo id. For HF specs it does NOT
+// download — it only confirms the repo+revision is reachable and prints
+// the cache location so the user knows where a subsequent `serve` would
+// stage files.
+func modelCheck(spec string) doctorCheck {
+	parsed, err := hfhub.ParseSpec(spec)
+	if err != nil {
+		return doctorCheck{name: "Model", status: "FAIL", detail: err.Error()}
+	}
+	if !parsed.IsLocal {
+		cacheDir := hfhub.DefaultCacheDir()
+		local := filepath.Join(cacheDir, "models--"+strings.ReplaceAll(parsed.Repo, "/", "--"))
+		cacheState := "not cached (will download on `serve`)"
+		if _, err := os.Stat(local); err == nil {
+			cacheState = "cached"
+		}
+		return doctorCheck{
+			name: "Model", status: "PASS",
+			detail: fmt.Sprintf("HF repo %s@%s — %s at %s",
+				parsed.Repo, parsed.Revision, cacheState, local),
+		}
+	}
+
+	path := parsed.LocalPath
+	info, err := os.Stat(path)
+	if err != nil {
+		return doctorCheck{
+			name: "Model", status: "FAIL",
+			detail: fmt.Sprintf("stat %s: %v", path, err),
+		}
+	}
+	if info.IsDir() {
+		// Expect HF layout: config.json + tokenizer.json + at least one .safetensors file.
+		needed := []string{"config.json"}
+		missing := []string{}
+		for _, f := range needed {
+			if _, err := os.Stat(filepath.Join(path, f)); err != nil {
+				missing = append(missing, f)
+			}
+		}
+		entries, _ := os.ReadDir(path)
+		hasWeights := false
+		for _, e := range entries {
+			n := e.Name()
+			if strings.HasSuffix(n, ".safetensors") || strings.HasSuffix(n, ".gguf") {
+				hasWeights = true
+				break
+			}
+		}
+		if len(missing) > 0 || !hasWeights {
+			d := fmt.Sprintf("missing: %v", missing)
+			if !hasWeights {
+				d += " (no .safetensors/.gguf in directory)"
+			}
+			return doctorCheck{name: "Model", status: "FAIL", detail: d}
+		}
+		return doctorCheck{
+			name: "Model", status: "PASS",
+			detail: fmt.Sprintf("HF directory at %s (config.json + weights present)", path),
+		}
+	}
+	switch {
+	case strings.HasSuffix(path, ".safetensors"):
+		return doctorCheck{
+			name: "Model", status: "PASS",
+			detail: fmt.Sprintf("safetensors file (%.1f GB)", float64(info.Size())/(1<<30)),
+		}
+	case strings.HasSuffix(path, ".gguf"):
+		return doctorCheck{
+			name: "Model", status: "PASS",
+			detail: fmt.Sprintf("GGUF file (%.1f GB) — note: only F32/F16/BF16 weights are supported", float64(info.Size())/(1<<30)),
+		}
+	default:
+		return doctorCheck{
+			name: "Model", status: "WARN",
+			detail: "unrecognised extension; expected .safetensors or .gguf",
+		}
+	}
 }
 
 func newLogger(level string) *slog.Logger {

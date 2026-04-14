@@ -1,8 +1,15 @@
-// Package model — tokenizer.go provides the byte-level BPE tokenizer.
+// Package model — tokenizer.go provides the byte-level fallback tokenizer.
 //
-// This is a minimal implementation sufficient for correctness testing.
-// A high-performance tokenizer (sentencepiece or tiktoken compatible)
-// will be integrated in a later milestone.
+// On the serve path, the primary tokenizer is HFTokenizer (hf_tokenizer.go),
+// which loads tokenizer.json. ByteLevelTokenizer below is used in two
+// situations:
+//   - mock/dev mode (no --model)
+//   - HF tokenizer load failure (cmd/gollmgo/gpu.go logs a warning)
+//
+// It encodes any input as raw UTF-8 bytes; decoding is exact for ASCII and
+// works for arbitrary bytes but won't reflect a real model's vocabulary.
+// If a real LLM is loaded with this fallback active, output will be
+// gibberish — make sure tokenizer.json is present alongside the weights.
 package model
 
 import (
@@ -10,9 +17,8 @@ import (
 	"strings"
 )
 
-// ByteLevelTokenizer maps each byte to a unique token ID.
-// This is a placeholder for development and testing.
-// Real tokenizer integration (sentencepiece/tiktoken) deferred to M5.
+// ByteLevelTokenizer maps each byte to a unique token ID. See package doc
+// for when this is used vs. the real HFTokenizer path.
 type ByteLevelTokenizer struct {
 	vocabSize int
 	eosID     int32

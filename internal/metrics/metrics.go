@@ -22,11 +22,12 @@ type Counters struct {
 	SchedulerQueueDepth atomic.Int64 // sequences waiting to be scheduled
 	SchedulerActiveCount atomic.Int64 // sequences currently in prefill/decode
 
-	// Prefix cache metrics (placeholder until M4).
+	// Prefix cache metrics. Updated by the prefix cache on Lookup hits/misses.
 	KVCacheHits    atomic.Int64
 	KVCacheLookups atomic.Int64
 
-	// CUDA graph metrics (placeholder until M3).
+	// CUDA graph metrics. Updated by CUDAModel.SyncGraphStats() after each
+	// paged forward pass.
 	GraphCacheHits    atomic.Int64
 	GraphCacheLookups atomic.Int64
 

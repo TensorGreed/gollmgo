@@ -22,7 +22,7 @@ func newTestServer(t *testing.T) (*Server, *engine.MockEngine) {
 	cfg := config.DefaultConfig()
 	tok := model.NewByteLevelTokenizer(256, 2)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return NewServer(cfg, eng, tok, log), eng
+	return NewServer(cfg, eng, tok, log, "test-model"), eng
 }
 
 // --- Health endpoints ---
@@ -61,8 +61,21 @@ func TestServerModels(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatal(err)
 	}
-	if len(resp.Data) == 0 {
-		t.Fatal("expected at least one model")
+	if len(resp.Data) != 1 {
+		t.Fatalf("expected exactly one model, got %d", len(resp.Data))
+	}
+	got := resp.Data[0]
+	if got.ID != "test-model" {
+		t.Errorf("/v1/models reported id=%q, expected %q (real id was lost)", got.ID, "test-model")
+	}
+	if got.Object != "model" {
+		t.Errorf("expected object=\"model\", got %q", got.Object)
+	}
+	if got.Created == 0 {
+		t.Error("expected non-zero Created timestamp")
+	}
+	if resp.Object != "list" {
+		t.Errorf("expected wrapper object=\"list\", got %q", resp.Object)
 	}
 }
 

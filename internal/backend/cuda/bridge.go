@@ -71,9 +71,13 @@ func (r *CUDARunner) Warmup(_ context.Context, profile backend.WarmupProfile) er
 	return nil
 }
 
+// Step on the bare CUDARunner has no model loaded. Real serving wraps
+// CUDARunner in CUDARunnerWithModel (see model_bridge.go), which carries
+// a CUDAModel + CUDAKVCache and provides its own Step that shadows this
+// one. The bare runner is only useful for capability discovery and
+// device-info queries; calling Step on it is a programming error.
 func (r *CUDARunner) Step(_ context.Context, _ *backend.Batch) (*backend.StepOutput, error) {
-	// Step dispatch will be implemented in M5 (correct eager inference).
-	return nil, fmt.Errorf("cuda: Step not yet implemented")
+	return nil, fmt.Errorf("cuda: bare CUDARunner has no model; use CUDARunnerWithModel for forward passes")
 }
 
 func (r *CUDARunner) Capabilities() backend.Capabilities {

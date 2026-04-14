@@ -15,22 +15,32 @@ import (
 
 // Server is the HTTP server for the OpenAI-compatible API.
 type Server struct {
-	cfg       config.Config
-	engine    engine.Engine
-	tokenizer model.Tokenizer
-	mux       *http.ServeMux
-	srv       *http.Server
-	log       *slog.Logger
+	cfg         config.Config
+	engine      engine.Engine
+	tokenizer   model.Tokenizer
+	mux         *http.ServeMux
+	srv         *http.Server
+	log         *slog.Logger
+	modelID     string
+	startedUnix int64
 }
 
-// NewServer creates a new API server wired to the given engine.
-func NewServer(cfg config.Config, eng engine.Engine, tok model.Tokenizer, log *slog.Logger) *Server {
+// NewServer creates a new API server wired to the given engine. The model
+// id is the identifier reported by /v1/models and accepted in chat
+// completion requests; pass the basename of the loaded model directory or
+// the literal "mock" in dev mode.
+func NewServer(cfg config.Config, eng engine.Engine, tok model.Tokenizer, log *slog.Logger, modelID string) *Server {
+	if modelID == "" {
+		modelID = "gollmgo-default"
+	}
 	s := &Server{
-		cfg:       cfg,
-		engine:    eng,
-		tokenizer: tok,
-		mux:       http.NewServeMux(),
-		log:       log,
+		cfg:         cfg,
+		engine:      eng,
+		tokenizer:   tok,
+		mux:         http.NewServeMux(),
+		log:         log,
+		modelID:     modelID,
+		startedUnix: time.Now().Unix(),
 	}
 	s.registerRoutes()
 	s.srv = &http.Server{
@@ -40,6 +50,9 @@ func NewServer(cfg config.Config, eng engine.Engine, tok model.Tokenizer, log *s
 	}
 	return s
 }
+
+// ModelID returns the id this server reports via /v1/models.
+func (s *Server) ModelID() string { return s.modelID }
 
 func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /health/live", LiveHandler())

@@ -12,20 +12,25 @@ import (
 	"github.com/TensorGreed/gollmgo/internal/backend/cuda"
 	"github.com/TensorGreed/gollmgo/internal/config"
 	"github.com/TensorGreed/gollmgo/internal/model"
+	"github.com/TensorGreed/gollmgo/internal/model/hfhub"
 )
 
-// initGPURunner creates a CUDA runner with a loaded model.
+// initGPURunner creates a CUDA runner with a loaded model. The handle
+// carries an already-resolved model directory (either a local path or a
+// freshly downloaded HF Hub repo — cmdServe handles that upstream).
 // Returns the runner, tokenizer, and the computed number of KV cache blocks
 // (so cmdServe can create a matching Go-side block pool).
-func initGPURunner(log *slog.Logger, cfg config.Config, deviceID int) (backend.Runner, model.Tokenizer, int, error) {
-	modelPath := cfg.ModelPath
+func initGPURunner(log *slog.Logger, cfg config.Config, handle *hfhub.Handle, deviceID int) (backend.Runner, model.Tokenizer, int, error) {
 	tokenizerPath := cfg.TokenizerPath
-	log.Info("initializing GPU runner", "model", modelPath, "device", deviceID)
-
-	dir := filepath.Dir(modelPath)
+	dir := handle.LocalDir
+	log.Info("initializing GPU runner", "model_dir", dir, "device", deviceID,
+		"repo", handle.RepoID, "sharded", handle.IsSharded, "shards", len(handle.WeightsFiles))
 
 	// --- Load config.json for authoritative model metadata ---
-	configPath := filepath.Join(dir, "config.json")
+	configPath := handle.ConfigPath
+	if configPath == "" {
+		configPath = filepath.Join(dir, "config.json")
+	}
 	hfCfg, err := model.LoadHFConfig(configPath)
 	if err != nil {
 		return nil, nil, 0, fmt.Errorf("load config.json: %w", err)
@@ -55,9 +60,17 @@ func initGPURunner(log *slog.Logger, cfg config.Config, deviceID int) (backend.R
 		"total_gb", fmt.Sprintf("%.1f", float64(info.TotalMemoryBytes)/(1<<30)),
 		"free_gb", fmt.Sprintf("%.1f", float64(info.FreeMemoryBytes)/(1<<30)))
 
-	// --- Load weights ---
-	log.Info("loading model weights", "path", modelPath)
-	tensors, _, err := model.LoadSafetensorsWeights(modelPath)
+	// --- Load weights. Handle both single-file and sharded layouts. ---
+	log.Info("loading model weights", "dir", dir)
+	var tensors []model.WeightTensor
+	if handle.IsSharded || len(handle.WeightsFiles) > 1 {
+		tensors, _, err = model.LoadSafetensorsDirectory(dir)
+	} else if len(handle.WeightsFiles) == 1 {
+		tensors, _, err = model.LoadSafetensorsWeights(handle.WeightsFiles[0])
+	} else {
+		// Backwards-compat: caller passed a single-file ModelPath directly.
+		tensors, _, err = model.LoadSafetensorsWeights(cfg.ModelPath)
+	}
 	if err != nil {
 		runner.Close()
 		return nil, nil, 0, fmt.Errorf("load weights: %w", err)
@@ -154,7 +167,11 @@ func initGPURunner(log *slog.Logger, cfg config.Config, deviceID int) (backend.R
 	// --- Load tokenizer ---
 	var tokenizer model.Tokenizer
 	if tokenizerPath == "" {
-		tokenizerPath = filepath.Join(dir, "tokenizer.json")
+		if handle.TokenizerPath != "" {
+			tokenizerPath = handle.TokenizerPath
+		} else {
+			tokenizerPath = filepath.Join(dir, "tokenizer.json")
+		}
 	}
 
 	hfTok, err := model.LoadHFTokenizer(tokenizerPath, "</s>", "<s>")

@@ -53,6 +53,29 @@ make lint             # static checks
 
 Go baseline: `Go 1.22.2+` for local development, with CI pinned to `Go 1.22.2`.
 
+## Serving a model
+
+`--model` accepts either a local path or a HuggingFace Hub repo id. HF
+repos are auto-downloaded to a cache directory on first use; subsequent
+runs skip files that already match the expected size.
+
+```bash
+# HF Hub (downloads on first run, cached after):
+bin/gollmgo serve --model meta-llama/Llama-3.1-8B-Instruct
+bin/gollmgo serve --model meta-llama/Llama-3.1-8B-Instruct@v0.1-release
+
+# Local path (file or directory):
+bin/gollmgo serve --model /models/my-llama/
+```
+
+Cache location (first match wins):
+1. `$GOLLMGO_CACHE_DIR`
+2. `$XDG_CACHE_HOME/gollmgo/hub`
+3. `~/.cache/gollmgo/hub`
+
+For gated/private models, set `HF_TOKEN` (or `HUGGING_FACE_HUB_TOKEN`) in
+the environment; the resolver forwards it as a bearer token.
+
 ## Hard Constraints
 - `CGO_ENABLED=1` for GPU builds.
 - No GPU allocation outside engine/kvcache ownership boundaries.

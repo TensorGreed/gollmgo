@@ -9,9 +9,11 @@ import (
 	"os"
 )
 
-// SafetensorsLoader loads model metadata from safetensors format files.
-// Full weight loading will come in M5; this extracts the JSON header
-// which contains tensor shapes, dtype, and model config.
+// SafetensorsLoader extracts the JSON header of a .safetensors file (tensor
+// names, shapes, dtypes, byte offsets). It is used by Loader callers that
+// only need metadata. For end-to-end weight upload to GPU memory, see
+// LoadSafetensorsWeights in weights.go — that's the path the serve command
+// actually uses (cmd/gollmgo/gpu.go).
 type SafetensorsLoader struct{}
 
 // safetensorsHeader is the JSON metadata at the start of a .safetensors file.
