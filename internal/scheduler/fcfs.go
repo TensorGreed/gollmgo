@@ -10,10 +10,11 @@ import (
 
 // FCFSConfig configures the FCFS scheduler.
 type FCFSConfig struct {
-	MaxBatchSize     int // max sequences per batch
-	MaxTokenBudget   int // max total tokens (prefill + decode) per tick
-	MaxQueueDepth    int // max waiting queue length (0 = unbounded)
-	PrefillChunkSize int // max prefill tokens per sequence per tick (0 = no chunking)
+	MaxBatchSize     int         // max sequences per batch
+	MaxTokenBudget   int         // max total tokens (prefill + decode) per tick
+	MaxQueueDepth    int         // max waiting queue length (0 = unbounded)
+	PrefillChunkSize int         // max prefill tokens per sequence per tick (0 = no chunking)
+	PreemptMode      PreemptMode // how preempted sequences are restored on re-admission
 }
 
 // DefaultFCFSConfig returns reasonable defaults.
@@ -150,6 +151,7 @@ func (s *FCFSScheduler) Tick(_ context.Context) (*SchedulerOutput, error) {
 			continue
 		}
 
+		restoreSwapState(seq)
 		s.active[seq.ID] = seq
 		out.ScheduledSequences = append(out.ScheduledSequences, seq)
 		out.PrefillBudgetUsed += firstChunk
@@ -188,6 +190,7 @@ func (s *FCFSScheduler) Preempt(seqID uint64) error {
 	if err := seq.Transition(SeqPreempted); err != nil {
 		return err
 	}
+	applyPreemption(seq, s.cfg.PreemptMode)
 	if err := seq.Transition(SeqWaiting); err != nil {
 		return err
 	}
@@ -228,6 +231,11 @@ func (s *FCFSScheduler) Find(seqID uint64) *Sequence {
 // PrefillChunkSize returns the configured chunk size for prefill budgeting.
 func (s *FCFSScheduler) PrefillChunkSize() int {
 	return s.cfg.PrefillChunkSize
+}
+
+// PreemptMode returns the configured preemption mode.
+func (s *FCFSScheduler) PreemptMode() PreemptMode {
+	return s.cfg.PreemptMode
 }
 
 // Compile-time check.

@@ -123,9 +123,13 @@ func (bt *BlockTable) Truncate(n int) {
 	}
 }
 
-// Free releases all blocks back to the pool.
+// Free releases this table's reference on each block back to the pool.
+// A block returns to the free list only when its total refcount reaches zero,
+// so blocks held by the prefix cache (or other refcount holders) survive.
 func (bt *BlockTable) Free() {
-	bt.pool.Free(bt.blocks)
+	for _, id := range bt.blocks {
+		bt.pool.Release(id)
+	}
 	bt.blocks = nil
 	bt.numTokens = 0
 }

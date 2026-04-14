@@ -122,12 +122,19 @@ func cmdServe(args []string) {
 	// Create Go-side KV cache pool matching the GPU-side allocation.
 	cache := kvcache.NewBlockPool(numBlocks, cfg.BlockSize)
 
-	// Create scheduler.
-	sched := scheduler.NewFCFSScheduler(scheduler.FCFSConfig{
-		MaxBatchSize:   cfg.MaxBatchSize,
-		MaxTokenBudget: cfg.MaxTokenBudget,
-		MaxQueueDepth:  cfg.MaxQueueDepth,
+	// Create scheduler from config-selected policy.
+	policy := schedulerPolicyFromString(cfg.SchedulerPolicy)
+	preemptMode := preemptModeFromString(cfg.PreemptMode)
+	sched := scheduler.NewScheduler(policy, scheduler.SchedulerConfig{
+		MaxBatchSize:     cfg.MaxBatchSize,
+		MaxTokenBudget:   cfg.MaxTokenBudget,
+		MaxQueueDepth:    cfg.MaxQueueDepth,
+		PrefillChunkSize: cfg.PrefillChunkSize,
+		AutoPreempt:      cfg.AutoPreempt,
+		PreemptMode:      preemptMode,
 	})
+	log.Info("scheduler ready", "policy", policy.String(), "preempt_mode", preemptMode.String(),
+		"prefill_chunk_size", cfg.PrefillChunkSize)
 
 	// Create serving engine.
 	eng := engine.NewServingEngine(engine.ServingEngineConfig{
@@ -540,6 +547,26 @@ func saveBenchResult(result BenchResult, data []byte) {
 		dir, result.Mode, result.Timestamp[:10],
 		strings.ReplaceAll(result.Timestamp[11:19], ":", ""))
 	os.WriteFile(filename, data, 0644)
+}
+
+func schedulerPolicyFromString(s string) scheduler.Policy {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "sjf":
+		return scheduler.PolicySJF
+	case "priority":
+		return scheduler.PolicyPriority
+	default:
+		return scheduler.PolicyFCFS
+	}
+}
+
+func preemptModeFromString(s string) scheduler.PreemptMode {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "swap":
+		return scheduler.PreemptSwap
+	default:
+		return scheduler.PreemptRecompute
+	}
 }
 
 func cmdDoctor(_ []string) {

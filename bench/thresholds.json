@@ -1,15 +1,15 @@
 {
-  "description": "Regression thresholds for automated parity checks",
+  "description": "Regression thresholds for automated parity checks. Metric names match the bench command's BenchResult JSON tags. error_rate_pct is derived as error_count / num_prompts * 100.",
   "thresholds": {
-    "throughput_tokens_per_sec": {
+    "tokens_per_second": {
       "min": 0,
       "regression_pct": 5.0,
-      "description": "Flag if throughput drops more than 5% vs baseline"
+      "description": "Higher is better. Flag if throughput drops more than 5% vs baseline."
     },
     "ttft_p50_ms": {
       "max": 15.0,
       "regression_pct": 20.0,
-      "description": "Flag if TTFT P50 exceeds 15ms or regresses >20%"
+      "description": "Lower is better. Flag if exceeds 15ms or regresses >20%."
     },
     "ttft_p99_ms": {
       "max": 50.0,
@@ -18,7 +18,7 @@
     "itl_p50_ms": {
       "max": 10.0,
       "regression_pct": 20.0,
-      "description": "Flag if ITL P50 exceeds 10ms or regresses >20%"
+      "description": "Lower is better. Flag if exceeds 10ms or regresses >20%."
     },
     "itl_p99_ms": {
       "max": 30.0,
@@ -26,7 +26,7 @@
     },
     "error_rate_pct": {
       "max": 1.0,
-      "description": "Flag if error rate exceeds 1%"
+      "description": "Derived from error_count/num_prompts. Flag if exceeds 1%."
     }
   }
 }

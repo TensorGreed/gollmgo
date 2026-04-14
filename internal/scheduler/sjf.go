@@ -220,5 +220,11 @@ func (s *SJFScheduler) Find(seqID uint64) *Sequence {
 	return s.all[seqID]
 }
 
+// PrefillChunkSize returns the configured chunk size for prefill budgeting.
+func (s *SJFScheduler) PrefillChunkSize() int { return s.cfg.PrefillChunkSize }
+
+// PreemptMode returns the configured preemption mode.
+func (s *SJFScheduler) PreemptMode() PreemptMode { return s.cfg.PreemptMode }
+
 // Compile-time check.
 var _ Scheduler = (*SJFScheduler)(nil)

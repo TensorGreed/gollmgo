@@ -9,8 +9,12 @@ on:
       - 'internal/kvcache/**'
       - 'kernels/**'
       - 'internal/backend/**'
+      - 'cmd/gollmgo/**'
+      - 'bench/**'
+      - '.github/workflows/benchmark.yml'
 
 jobs:
+  # Go-level micro-benchmarks. Always runs on PRs in scope.
   unit-benchmarks:
     runs-on: ubuntu-latest
     steps:
@@ -18,21 +22,27 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.22.2'
-      - name: Run Go benchmarks
+      - name: Run Go benchmarks (CPU-only packages)
         run: |
-          go test -bench=. -benchmem -count=3 -timeout=10m ./internal/scheduler/... ./internal/kvcache/... ./internal/engine/... | tee bench_current.txt
-      - name: Compare benchmarks
-        uses: bencherdev/bencher@main
-        continue-on-error: true
-        with:
-          command: cat bench_current.txt
-      - name: Upload benchmark results
+          go test -bench=. -benchmem -count=3 -timeout=10m \
+            ./internal/scheduler/... \
+            ./internal/kvcache/... \
+            ./internal/benchcheck/... | tee bench_current.txt
+      - name: Self-test regression checker against placeholder baseline
+        run: |
+          go run ./internal/benchcheck/cmd \
+            --baseline bench/baseline_result.json \
+            --current  bench/baseline_result.json \
+            --thresholds bench/thresholds.json
+      - name: Upload benchmark output
         uses: actions/upload-artifact@v4
         with:
-          name: benchmark-results
+          name: unit-benchmark-results
           path: bench_current.txt
 
-  # GPU benchmarks run on self-hosted runner (when available)
+  # End-to-end serving benchmark. Runs only on a self-hosted GPU runner when a
+  # PR carries the "run-gpu-bench" label. Starts the server in the background
+  # before benching, then runs the regression check.
   gpu-benchmarks:
     runs-on: [self-hosted, gpu]
     if: contains(github.event.pull_request.labels.*.name, 'run-gpu-bench')
@@ -41,15 +51,43 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.22.2'
-      - name: Build
+      - name: Build (CGO_ENABLED=1, gpu tag)
         run: make build
+      - name: Start gollmgo server
+        run: |
+          mkdir -p bench/results
+          nohup bin/gollmgo serve \
+            --config bench/baseline_config.json \
+            > bench/results/server.log 2>&1 &
+          echo $! > bench/results/server.pid
+          # Wait for /healthz (or up to 60s).
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:8080/healthz >/dev/null 2>&1; then
+              echo "server is up"
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS http://localhost:8080/healthz
       - name: Run serving benchmark
         run: |
-          bin/gollmgo bench --mode serving --config bench/baseline_config.json --url http://localhost:8080 > bench/results/current.json
-      - name: Check regression
+          bin/gollmgo bench --mode serving \
+            --config bench/baseline_config.json \
+            --url http://localhost:8080 \
+            > bench/results/current.json
+      - name: Check regression vs baseline
         run: bash bench/check_regression.sh bench/results/current.json
+      - name: Stop server
+        if: always()
+        run: |
+          if [ -f bench/results/server.pid ]; then
+            kill "$(cat bench/results/server.pid)" || true
+          fi
       - name: Upload results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: gpu-benchmark-results
-          path: bench/results/current.json
+          path: |
+            bench/results/current.json
+            bench/results/server.log

@@ -65,6 +65,7 @@ func NewScheduler(policy Policy, cfg SchedulerConfig) Scheduler {
 			MaxTokenBudget:   cfg.MaxTokenBudget,
 			MaxQueueDepth:    cfg.MaxQueueDepth,
 			PrefillChunkSize: cfg.PrefillChunkSize,
+			PreemptMode:      cfg.PreemptMode,
 		})
 	}
 }

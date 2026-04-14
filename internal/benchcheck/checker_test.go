@@ -8,7 +8,7 @@ import (
 var testThresholds = []byte(`{
   "description": "test thresholds",
   "thresholds": {
-    "throughput_tokens_per_sec": {
+    "tokens_per_second": {
       "min": 0,
       "regression_pct": 5.0
     },
@@ -34,12 +34,20 @@ var testThresholds = []byte(`{
   }
 }`)
 
+// baseline matches the BenchResult schema from cmd/gollmgo. 1000 tok/s,
+// 10ms TTFT P50, 7ms ITL P50, 0.5% error rate (5 errors / 1000 prompts).
 func baseline() []byte {
-	return []byte(`{"metrics":{"throughput_tokens_per_sec":1000,"ttft_p50_ms":10,"ttft_p99_ms":30,"itl_p50_ms":7,"itl_p99_ms":20,"error_rate_pct":0.5}}`)
+	return []byte(`{
+		"num_prompts": 1000,
+		"error_count": 5,
+		"tokens_per_second": 1000,
+		"ttft_p50_ms": 10, "ttft_p99_ms": 30,
+		"itl_p50_ms": 7, "itl_p99_ms": 20
+	}`)
 }
 
 func TestCheckAllPass(t *testing.T) {
-	current := []byte(`{"metrics":{"throughput_tokens_per_sec":1000,"ttft_p50_ms":10,"ttft_p99_ms":30,"itl_p50_ms":7,"itl_p99_ms":20,"error_rate_pct":0.5}}`)
+	current := baseline()
 	report, err := CheckBytes(baseline(), current, testThresholds)
 	if err != nil {
 		t.Fatal(err)
@@ -50,7 +58,13 @@ func TestCheckAllPass(t *testing.T) {
 }
 
 func TestCheckThroughputRegression(t *testing.T) {
-	current := []byte(`{"metrics":{"throughput_tokens_per_sec":900,"ttft_p50_ms":10,"ttft_p99_ms":30,"itl_p50_ms":7,"itl_p99_ms":20,"error_rate_pct":0.5}}`)
+	// 900 tok/s vs baseline 1000 = 10% drop, exceeds 5% threshold.
+	current := []byte(`{
+		"num_prompts": 1000, "error_count": 5,
+		"tokens_per_second": 900,
+		"ttft_p50_ms": 10, "ttft_p99_ms": 30,
+		"itl_p50_ms": 7, "itl_p99_ms": 20
+	}`)
 	report, err := CheckBytes(baseline(), current, testThresholds)
 	if err != nil {
 		t.Fatal(err)
@@ -59,18 +73,24 @@ func TestCheckThroughputRegression(t *testing.T) {
 		t.Errorf("expected FAIL, got %s\n%s", report.Overall, report.String())
 	}
 	for _, r := range report.Results {
-		if r.Name == "throughput_tokens_per_sec" {
+		if r.Name == "tokens_per_second" {
 			if r.Verdict != VerdictFail {
-				t.Errorf("expected throughput FAIL, got %s", r.Verdict)
+				t.Errorf("expected tokens_per_second FAIL, got %s", r.Verdict)
 			}
 			return
 		}
 	}
-	t.Error("throughput metric not found in results")
+	t.Error("tokens_per_second metric not found in results")
 }
 
 func TestCheckAbsoluteThresholdFail(t *testing.T) {
-	current := []byte(`{"metrics":{"throughput_tokens_per_sec":1000,"ttft_p50_ms":20,"ttft_p99_ms":30,"itl_p50_ms":7,"itl_p99_ms":20,"error_rate_pct":0.5}}`)
+	// TTFT P50 of 20ms exceeds the 15ms cap.
+	current := []byte(`{
+		"num_prompts": 1000, "error_count": 5,
+		"tokens_per_second": 1000,
+		"ttft_p50_ms": 20, "ttft_p99_ms": 30,
+		"itl_p50_ms": 7, "itl_p99_ms": 20
+	}`)
 	report, err := CheckBytes(baseline(), current, testThresholds)
 	if err != nil {
 		t.Fatal(err)
@@ -92,8 +112,40 @@ func TestCheckAbsoluteThresholdFail(t *testing.T) {
 	t.Error("ttft_p50_ms metric not found in results")
 }
 
+func TestCheckErrorRateDerived(t *testing.T) {
+	// 50 errors / 1000 prompts = 5% > 1% cap.
+	current := []byte(`{
+		"num_prompts": 1000, "error_count": 50,
+		"tokens_per_second": 1000,
+		"ttft_p50_ms": 10, "ttft_p99_ms": 30,
+		"itl_p50_ms": 7, "itl_p99_ms": 20
+	}`)
+	report, err := CheckBytes(baseline(), current, testThresholds)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Overall != VerdictFail {
+		t.Fatalf("expected FAIL on derived error_rate_pct, got %s\n%s", report.Overall, report.String())
+	}
+	var found bool
+	for _, r := range report.Results {
+		if r.Name == "error_rate_pct" {
+			found = true
+			if r.Current != 5 {
+				t.Errorf("expected error_rate_pct=5, got %v", r.Current)
+			}
+			if r.Verdict != VerdictFail {
+				t.Errorf("expected error_rate_pct FAIL, got %s", r.Verdict)
+			}
+		}
+	}
+	if !found {
+		t.Error("error_rate_pct metric not in results")
+	}
+}
+
 func TestCheckReportFormatting(t *testing.T) {
-	current := []byte(`{"metrics":{"throughput_tokens_per_sec":1000,"ttft_p50_ms":10,"ttft_p99_ms":30,"itl_p50_ms":7,"itl_p99_ms":20,"error_rate_pct":0.5}}`)
+	current := baseline()
 	report, err := CheckBytes(baseline(), current, testThresholds)
 	if err != nil {
 		t.Fatal(err)
@@ -108,7 +160,7 @@ func TestCheckReportFormatting(t *testing.T) {
 	if !strings.Contains(s, "Metric") {
 		t.Error("missing table header")
 	}
-	if !strings.Contains(s, "throughput_tokens_per_sec") {
+	if !strings.Contains(s, "tokens_per_second") {
 		t.Error("missing throughput metric in output")
 	}
 }

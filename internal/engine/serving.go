@@ -18,7 +18,7 @@ import (
 // It owns the scheduler, KV cache, and coordinates the full serving pipeline.
 type ServingEngine struct {
 	runner      backend.Runner
-	sched       *scheduler.FCFSScheduler
+	sched       scheduler.Scheduler
 	cache       *kvcache.BlockPool
 	prefixCache *kvcache.PrefixCache // optional prefix caching for KV block reuse
 	tokenizer   model.Tokenizer
@@ -27,6 +27,7 @@ type ServingEngine struct {
 	log         *slog.Logger
 
 	preemptWatermark float64
+	maxPrefixBlocks  int
 
 	mu          sync.Mutex
 	blockTables map[uint64]*kvcache.BlockTable // seqID -> block table
@@ -38,7 +39,7 @@ type ServingEngine struct {
 // ServingEngineConfig holds configuration for the serving engine.
 type ServingEngineConfig struct {
 	Runner      backend.Runner
-	Scheduler   *scheduler.FCFSScheduler
+	Scheduler   scheduler.Scheduler
 	Cache       *kvcache.BlockPool
 	Tokenizer   model.Tokenizer
 	Sampling    SamplingParams
@@ -49,6 +50,9 @@ type ServingEngineConfig struct {
 	PreemptWatermark float64
 	// EnablePrefixCache enables block-level prefix caching for KV reuse.
 	EnablePrefixCache bool
+	// MaxPrefixBlocks caps the number of blocks the prefix cache may pin.
+	// 0 derives a default of 50% of the pool.
+	MaxPrefixBlocks int
 }
 
 // NewServingEngine creates the engine. Call Start to begin the batching loop.
@@ -56,9 +60,13 @@ func NewServingEngine(cfg ServingEngineConfig) *ServingEngine {
 	if cfg.PreemptWatermark <= 0 {
 		cfg.PreemptWatermark = 0.95
 	}
+	maxPrefix := cfg.MaxPrefixBlocks
+	if maxPrefix <= 0 {
+		maxPrefix = cfg.Cache.NumTotalBlocks() / 2
+	}
 	var prefixCache *kvcache.PrefixCache
 	if cfg.EnablePrefixCache {
-		prefixCache = kvcache.NewPrefixCache(cfg.Cache)
+		prefixCache = kvcache.NewPrefixCacheWithCap(cfg.Cache, maxPrefix)
 	}
 
 	e := &ServingEngine{
@@ -71,6 +79,7 @@ func NewServingEngine(cfg ServingEngineConfig) *ServingEngine {
 		eosID:            cfg.Tokenizer.EOSTokenID(),
 		log:              cfg.Log,
 		preemptWatermark: cfg.PreemptWatermark,
+		maxPrefixBlocks:  maxPrefix,
 		blockTables:      make(map[uint64]*kvcache.BlockTable),
 		subscribers:      make(map[uint64]chan TokenResult),
 		loopDone:         make(chan struct{}),
@@ -336,7 +345,11 @@ func (e *ServingEngine) Stop() error {
 }
 
 // checkMemoryPressure preempts the longest decode sequence if cache
-// utilization exceeds the watermark. This frees blocks for new requests.
+// utilization exceeds the watermark. The victim is returned to the
+// scheduler's waiting queue via Preempt; blocks are released so new
+// requests can make forward progress. The scheduler's PreemptMode
+// decides whether the victim restarts from scratch (recompute) or
+// resumes from saved progress (swap) when re-admitted.
 func (e *ServingEngine) checkMemoryPressure() {
 	util := e.cache.Utilization()
 	if util < e.preemptWatermark {
@@ -350,6 +363,10 @@ func (e *ServingEngine) checkMemoryPressure() {
 	var victimID uint64
 	victimBlocks := 0
 	for seqID, bt := range e.blockTables {
+		seq := e.sched.Find(seqID)
+		if seq == nil || seq.State != scheduler.SeqDecoding {
+			continue // only preempt active decoders
+		}
 		if bt.NumBlocks() > victimBlocks {
 			victimBlocks = bt.NumBlocks()
 			victimID = seqID
@@ -364,29 +381,43 @@ func (e *ServingEngine) checkMemoryPressure() {
 		"utilization", util,
 		"watermark", e.preemptWatermark,
 		"victim_seq", victimID,
-		"victim_blocks", victimBlocks)
+		"victim_blocks", victimBlocks,
+		"mode", e.sched.PreemptMode())
 
-	// Free blocks and notify subscriber of preemption error.
 	if bt, ok := e.blockTables[victimID]; ok {
 		bt.Free()
 		delete(e.blockTables, victimID)
 	}
 
-	errResult := TokenResult{
-		SequenceID: victimID,
-		Finished:   true,
-		Err:        fmt.Errorf("preempted: KV cache memory pressure (%.0f%% used)", util*100),
-	}
-	if ch, ok := e.subscribers[victimID]; ok {
-		select {
-		case ch <- errResult:
-		default:
-		}
-		close(ch)
-		delete(e.subscribers, victimID)
+	// We've freed the victim's KV blocks without copying them to host memory,
+	// so true swap-resume is not possible from the engine side. Force the
+	// scheduler to treat this as a recompute even if PreemptMode is Swap.
+	if seq := e.sched.Find(victimID); seq != nil {
+		seq.PrefillConsumed = 0
+		seq.SwapState = nil
 	}
 
-	e.sched.Complete(victimID)
+	if err := e.sched.Preempt(victimID); err != nil {
+		// Preempt may fail if the sequence already finished mid-step.
+		// Fall back to terminating the request to avoid leaking state.
+		e.log.Warn("preempt failed, terminating", "seq", victimID, "error", err)
+		errResult := TokenResult{
+			SequenceID: victimID,
+			Finished:   true,
+			Err:        fmt.Errorf("preempted: KV cache memory pressure (%.0f%% used)", util*100),
+		}
+		if ch, ok := e.subscribers[victimID]; ok {
+			select {
+			case ch <- errResult:
+			default:
+			}
+			close(ch)
+			delete(e.subscribers, victimID)
+		}
+		e.sched.Complete(victimID)
+	}
+	// On success: subscriber stays open. The sequence will be re-admitted
+	// by a later Tick and continue streaming through the same channel.
 }
 
 func (e *ServingEngine) cleanupSequence(seqID uint64) {

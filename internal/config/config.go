@@ -12,9 +12,13 @@ type Config struct {
 	TokenizerPath string `json:"tokenizer_path"`
 
 	// Scheduler settings.
-	MaxBatchSize   int `json:"max_batch_size"`
-	MaxTokenBudget int `json:"max_token_budget"`
-	MaxQueueDepth  int `json:"max_queue_depth"`
+	MaxBatchSize     int    `json:"max_batch_size"`
+	MaxTokenBudget   int    `json:"max_token_budget"`
+	MaxQueueDepth    int    `json:"max_queue_depth"`
+	PrefillChunkSize int    `json:"prefill_chunk_size"`
+	SchedulerPolicy  string `json:"scheduler_policy"` // "fcfs" (default), "sjf", "priority"
+	PreemptMode      string `json:"preempt_mode"`      // "recompute" (default), "swap"
+	AutoPreempt      bool   `json:"auto_preempt"`      // priority-only: high-priority arrivals preempt
 
 	// KV cache settings.
 	BlockSize         int     `json:"block_size"`
@@ -47,6 +51,9 @@ func DefaultConfig() Config {
 		MaxBatchSize:      64,
 		MaxTokenBudget:    4096,
 		MaxQueueDepth:     256,
+		PrefillChunkSize:  512,
+		SchedulerPolicy:   "fcfs",
+		PreemptMode:       "recompute",
 		BlockSize:         16,
 		MaxMemoryFraction: 0.9,
 		LogLevel:          "info",

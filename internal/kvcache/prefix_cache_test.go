@@ -170,6 +170,91 @@ func TestBlockTableMatchPrefix(t *testing.T) {
 	}
 }
 
+// TestDonateThenFreeKeepsCacheValid simulates the engine cleanup path:
+// a sequence donates its completed blocks to the prefix cache and then
+// frees its block table. The cache must keep ownership of those blocks so
+// later prefix lookups return live, exclusive references rather than
+// reclaimed-and-reallocated blocks.
+func TestDonateThenFreeKeepsCacheValid(t *testing.T) {
+	pool := NewBlockPool(4, 4)
+	cache := NewPrefixCache(pool)
+
+	tokenIDs := []int32{1, 2, 3, 4, 5, 6, 7, 8} // 2 complete blocks
+	bt := NewBlockTable(1, pool)
+	if _, err := bt.AppendN(8); err != nil {
+		t.Fatal(err)
+	}
+	donated := bt.PhysicalBlocks()
+
+	cache.DonateBlocks(tokenIDs, donated, 4)
+
+	// Engine cleanup: free the sequence's table. Cache must retain ownership.
+	bt.Free()
+
+	// None of the donated blocks should be back on the free list.
+	if pool.NumFreeBlocks() != 2 {
+		t.Fatalf("expected 2 free (only the unused half of the pool), got %d", pool.NumFreeBlocks())
+	}
+	for _, b := range donated {
+		if rc := pool.RefCount(b); rc != 1 {
+			t.Fatalf("donated block %d should have refcount 1 (cache only), got %d", b, rc)
+		}
+	}
+
+	// Subsequent allocation must not return a cached block.
+	allocated, err := pool.Allocate(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cachedSet := map[BlockID]bool{donated[0]: true, donated[1]: true}
+	for _, b := range allocated {
+		if cachedSet[b] {
+			t.Fatalf("pool returned cache-owned block %d", b)
+		}
+	}
+
+	// A fresh request should still get a prefix hit on the donated blocks.
+	bt2 := NewBlockTable(2, pool)
+	matched := bt2.MatchPrefix(tokenIDs, cache)
+	if matched != 8 {
+		t.Fatalf("expected 8-token prefix hit after donor freed, got %d", matched)
+	}
+}
+
+// TestPrefixCacheCapEvictsLRU verifies the bounded-size cache evicts the LRU
+// entry on insert once the cap is reached.
+func TestPrefixCacheCapEvictsLRU(t *testing.T) {
+	pool := NewBlockPool(8, 4)
+	cache := NewPrefixCacheWithCap(pool, 2)
+
+	blocks, _ := pool.Allocate(3)
+	hashes := []uint64{
+		ChainHash(0, []int32{1, 1, 1, 1}),
+		ChainHash(0, []int32{2, 2, 2, 2}),
+		ChainHash(0, []int32{3, 3, 3, 3}),
+	}
+
+	cache.Insert(hashes[0], blocks[0])
+	cache.Insert(hashes[1], blocks[1])
+	if cache.Len() != 2 {
+		t.Fatalf("expected cache len 2, got %d", cache.Len())
+	}
+
+	// Touch blocks[0] so blocks[1] becomes LRU.
+	if _, ok := cache.Lookup(hashes[0]); !ok {
+		t.Fatal("expected hit on hashes[0]")
+	}
+	pool.Release(blocks[0]) // drop the lookup ref
+
+	cache.Insert(hashes[2], blocks[2])
+	if cache.Len() != 2 {
+		t.Fatalf("expected cache len 2 after cap-driven evict, got %d", cache.Len())
+	}
+	if _, ok := cache.Lookup(hashes[1]); ok {
+		t.Fatal("expected hashes[1] (LRU) to be evicted")
+	}
+}
+
 func TestDonateBlocksPartial(t *testing.T) {
 	pool := NewBlockPool(10, 4)
 	cache := NewPrefixCache(pool)

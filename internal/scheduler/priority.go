@@ -234,5 +234,11 @@ func (s *PriorityScheduler) Find(seqID uint64) *Sequence {
 	return s.all[seqID]
 }
 
+// PrefillChunkSize returns the configured chunk size for prefill budgeting.
+func (s *PriorityScheduler) PrefillChunkSize() int { return s.cfg.PrefillChunkSize }
+
+// PreemptMode returns the configured preemption mode.
+func (s *PriorityScheduler) PreemptMode() PreemptMode { return s.cfg.PreemptMode }
+
 // Compile-time check.
 var _ Scheduler = (*PriorityScheduler)(nil)

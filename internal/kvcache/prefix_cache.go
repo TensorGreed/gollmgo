@@ -12,21 +12,36 @@ import (
 // PrefixCache maps chain-hashed token block content to physical BlockIDs.
 // It enables reuse of KV cache blocks across requests that share a prefix
 // (e.g. the same system prompt). Uses LRU eviction when the pool is full.
+//
+// When MaxBlocks > 0, Insert evicts the LRU entry once the cache reaches the
+// cap. When MaxBlocks <= 0 the cache is unbounded (callers must drive
+// eviction explicitly via Evict).
 type PrefixCache struct {
-	mu      sync.Mutex
-	pool    *BlockPool
-	entries map[uint64]BlockID      // chainHash → physical block
-	lruList *list.List              // front = most recently used
-	lruMap  map[BlockID]*list.Element // block → LRU element
+	mu        sync.Mutex
+	pool      *BlockPool
+	maxBlocks int
+	entries   map[uint64]BlockID      // chainHash → physical block
+	hashFor   map[BlockID]uint64      // block → chainHash (for cheap reverse lookup on evict)
+	lruList   *list.List              // front = most recently used
+	lruMap    map[BlockID]*list.Element // block → LRU element
 }
 
-// NewPrefixCache creates a prefix cache backed by the given block pool.
+// NewPrefixCache creates an unbounded prefix cache backed by the given block pool.
 func NewPrefixCache(pool *BlockPool) *PrefixCache {
+	return NewPrefixCacheWithCap(pool, 0)
+}
+
+// NewPrefixCacheWithCap creates a prefix cache that evicts the LRU entry
+// once the cached block count exceeds maxBlocks. maxBlocks <= 0 disables
+// the automatic cap (use Evict manually).
+func NewPrefixCacheWithCap(pool *BlockPool, maxBlocks int) *PrefixCache {
 	return &PrefixCache{
-		pool:    pool,
-		entries: make(map[uint64]BlockID),
-		lruList: list.New(),
-		lruMap:  make(map[BlockID]*list.Element),
+		pool:      pool,
+		maxBlocks: maxBlocks,
+		entries:   make(map[uint64]BlockID),
+		hashFor:   make(map[BlockID]uint64),
+		lruList:   list.New(),
+		lruMap:    make(map[BlockID]*list.Element),
 	}
 }
 
@@ -84,8 +99,33 @@ func (c *PrefixCache) Insert(chainHash uint64, blockID BlockID) {
 	// The cache takes a ref.
 	c.pool.Ref(blockID)
 	c.entries[chainHash] = blockID
+	c.hashFor[blockID] = chainHash
 	elem := c.lruList.PushFront(blockID)
 	c.lruMap[blockID] = elem
+
+	// Enforce capacity (LRU eviction).
+	if c.maxBlocks > 0 {
+		for c.lruList.Len() > c.maxBlocks {
+			c.evictOneLocked()
+		}
+	}
+}
+
+// evictOneLocked drops the LRU entry. Caller must hold c.mu.
+func (c *PrefixCache) evictOneLocked() bool {
+	elem := c.lruList.Back()
+	if elem == nil {
+		return false
+	}
+	blockID := elem.Value.(BlockID)
+	c.lruList.Remove(elem)
+	delete(c.lruMap, blockID)
+	if hash, ok := c.hashFor[blockID]; ok {
+		delete(c.entries, hash)
+		delete(c.hashFor, blockID)
+	}
+	c.pool.Release(blockID)
+	return true
 }
 
 // Evict removes up to n least-recently-used blocks from the cache,
@@ -95,27 +135,10 @@ func (c *PrefixCache) Evict(n int) int {
 	defer c.mu.Unlock()
 
 	evicted := 0
-	for evicted < n && c.lruList.Len() > 0 {
-		elem := c.lruList.Back()
-		if elem == nil {
+	for evicted < n {
+		if !c.evictOneLocked() {
 			break
 		}
-		blockID := elem.Value.(BlockID)
-
-		// Remove from cache structures.
-		c.lruList.Remove(elem)
-		delete(c.lruMap, blockID)
-
-		// Find and remove the hash entry.
-		for hash, bid := range c.entries {
-			if bid == blockID {
-				delete(c.entries, hash)
-				break
-			}
-		}
-
-		// Release the cache's ref.
-		c.pool.Release(blockID)
 		evicted++
 	}
 	return evicted
