@@ -353,10 +353,167 @@ void test_v2_vs_v1() {
     delete[] h_slot_table; delete[] h_out_v1; delete[] h_out_v2_f32;
 }
 
+/*
+ * Parameterized v2-vs-v1 parity sweep. Exercises multiple combinations of
+ * seq_len, head counts, GQA ratios and partition sizes so the long-context
+ * path is covered end-to-end (Epic 2 M2 acceptance gate).
+ */
+struct v2ParityCase {
+    int seq_len;
+    int num_heads;
+    int num_kv_heads;
+    int head_dim;
+    const char* label;
+};
+
+static void run_v2_parity_case(const v2ParityCase& tc) {
+    printf("v2_parity [%s] seq_len=%d H=%d KV=%d D=%d... ",
+           tc.label, tc.seq_len, tc.num_heads, tc.num_kv_heads, tc.head_dim);
+    const int n_query = 1;
+    const int partition_size = PAGED_ATTN_V2_PARTITION_SIZE;
+    const float scale = 1.0f / sqrtf((float)tc.head_dim);
+
+    srand(4242 + tc.seq_len + tc.num_heads * 7 + tc.num_kv_heads);
+
+    int kv_entry = tc.num_kv_heads * tc.head_dim;
+    int q_total = n_query * tc.num_heads * tc.head_dim;
+    int cache_entries = tc.seq_len * kv_entry;
+
+    float* h_q_f32 = new float[q_total];
+    float* h_k_f32 = new float[cache_entries];
+    float* h_v_f32 = new float[cache_entries];
+    for (int i = 0; i < q_total; i++) h_q_f32[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.5f;
+    for (int i = 0; i < cache_entries; i++) h_k_f32[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.5f;
+    for (int i = 0; i < cache_entries; i++) h_v_f32[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.5f;
+
+    __half* h_q = new __half[q_total];
+    __half* h_k = new __half[cache_entries];
+    __half* h_v = new __half[cache_entries];
+    for (int i = 0; i < q_total; i++) h_q[i] = __float2half(h_q_f32[i]);
+    for (int i = 0; i < cache_entries; i++) h_k[i] = __float2half(h_k_f32[i]);
+    for (int i = 0; i < cache_entries; i++) h_v[i] = __float2half(h_v_f32[i]);
+
+    __half *d_q, *d_k_cache, *d_v_cache, *d_out_v1;
+    CHECK_CUDA(cudaMalloc(&d_q, q_total * sizeof(__half)));
+    CHECK_CUDA(cudaMalloc(&d_k_cache, cache_entries * sizeof(__half)));
+    CHECK_CUDA(cudaMalloc(&d_v_cache, cache_entries * sizeof(__half)));
+    CHECK_CUDA(cudaMalloc(&d_out_v1, q_total * sizeof(__half)));
+    CHECK_CUDA(cudaMemcpy(d_q, h_q, q_total * sizeof(__half), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_k_cache, h_k, cache_entries * sizeof(__half), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_v_cache, h_v, cache_entries * sizeof(__half), cudaMemcpyHostToDevice));
+
+    int32_t* h_slot_table = new int32_t[tc.seq_len];
+    for (int i = 0; i < tc.seq_len; i++) h_slot_table[i] = i;
+    int32_t h_seq_len = tc.seq_len;
+
+    int32_t *d_seq_lens, *d_slot_table;
+    CHECK_CUDA(cudaMalloc(&d_seq_lens, sizeof(int32_t)));
+    CHECK_CUDA(cudaMalloc(&d_slot_table, tc.seq_len * sizeof(int32_t)));
+    CHECK_CUDA(cudaMemcpy(d_seq_lens, &h_seq_len, sizeof(int32_t), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_slot_table, h_slot_table, tc.seq_len * sizeof(int32_t), cudaMemcpyHostToDevice));
+
+    /* v1 */
+    {
+        dim3 grid(1, tc.num_heads);
+        int threads = 32;
+        int smem = tc.seq_len * sizeof(float);
+        paged_attention_v1_f16<<<grid, threads, smem>>>(
+            d_q, d_k_cache, d_v_cache, d_out_v1,
+            d_seq_lens, d_slot_table,
+            1, tc.num_heads, tc.num_kv_heads, tc.head_dim, tc.seq_len, scale);
+        CHECK_CUDA(cudaDeviceSynchronize());
+    }
+    __half* h_out_v1 = new __half[q_total];
+    CHECK_CUDA(cudaMemcpy(h_out_v1, d_out_v1, q_total * sizeof(__half), cudaMemcpyDeviceToHost));
+
+    /* v2 */
+    int num_parts = (tc.seq_len + partition_size - 1) / partition_size;
+    float *d_exp_sums, *d_max_logits, *d_partial_out, *d_reduce_out;
+    size_t scalar_sz = n_query * tc.num_heads * num_parts * sizeof(float);
+    size_t vec_sz = (size_t)n_query * tc.num_heads * num_parts * tc.head_dim * sizeof(float);
+    size_t out_sz = n_query * tc.num_heads * tc.head_dim * sizeof(float);
+    CHECK_CUDA(cudaMalloc(&d_exp_sums, scalar_sz));
+    CHECK_CUDA(cudaMalloc(&d_max_logits, scalar_sz));
+    CHECK_CUDA(cudaMalloc(&d_partial_out, vec_sz));
+    CHECK_CUDA(cudaMalloc(&d_reduce_out, out_sz));
+    {
+        dim3 grid(1, tc.num_heads, num_parts);
+        int threads = 32;
+        int smem = partition_size * sizeof(float);
+        paged_attention_v2_phase1_f16<<<grid, threads, smem>>>(
+            d_q, d_k_cache, d_v_cache,
+            d_exp_sums, d_max_logits, d_partial_out,
+            d_seq_lens, d_slot_table,
+            1, tc.num_heads, tc.num_kv_heads, tc.head_dim, tc.seq_len, scale, partition_size);
+        CHECK_CUDA(cudaDeviceSynchronize());
+    }
+    {
+        dim3 grid(1, tc.num_heads);
+        int threads = 32;
+        int smem = num_parts * sizeof(float);
+        paged_attention_v2_reduce<<<grid, threads, smem>>>(
+            d_exp_sums, d_max_logits, d_partial_out, d_reduce_out,
+            d_seq_lens, 1, tc.num_heads, tc.head_dim, partition_size, num_parts);
+        CHECK_CUDA(cudaDeviceSynchronize());
+    }
+
+    float* h_out_v2_f32 = new float[q_total];
+    CHECK_CUDA(cudaMemcpy(h_out_v2_f32, d_reduce_out, out_sz, cudaMemcpyDeviceToHost));
+
+    float max_diff = 0.0f;
+    int local_failures = 0;
+    for (int i = 0; i < q_total; i++) {
+        float v1_val = __half2float(h_out_v1[i]);
+        float v2_val = h_out_v2_f32[i];
+        float diff = fabsf(v1_val - v2_val);
+        if (diff > max_diff) max_diff = diff;
+        if (diff > 0.1f) {
+            if (local_failures < 4) {
+                fprintf(stderr, "  FAIL [%s][%d]: v1=%.4f v2=%.4f diff=%.4f\n",
+                        tc.label, i, v1_val, v2_val, diff);
+            }
+            local_failures++;
+        }
+    }
+    if (local_failures > 0) {
+        printf("FAIL (%d elems, max_diff=%.4f, partitions=%d)\n",
+               local_failures, max_diff, num_parts);
+        failures += local_failures;
+    } else {
+        printf("PASS (max_diff=%.4f, partitions=%d)\n", max_diff, num_parts);
+    }
+
+    cudaFree(d_q); cudaFree(d_k_cache); cudaFree(d_v_cache); cudaFree(d_out_v1);
+    cudaFree(d_seq_lens); cudaFree(d_slot_table);
+    cudaFree(d_exp_sums); cudaFree(d_max_logits); cudaFree(d_partial_out); cudaFree(d_reduce_out);
+    delete[] h_q_f32; delete[] h_k_f32; delete[] h_v_f32;
+    delete[] h_q; delete[] h_k; delete[] h_v;
+    delete[] h_slot_table; delete[] h_out_v1; delete[] h_out_v2_f32;
+}
+
+void test_v2_parity_sweep() {
+    // Covers:
+    //  - boundary at partition_size (256): one partition
+    //  - multi-partition 2k / 4k / 8k seq_lens
+    //  - MHA (no GQA) and GQA (2:1, 4:1)
+    //  - head_dim 64 and 128 (common in modern models)
+    const v2ParityCase cases[] = {
+        {256,   4, 4, 64,  "short-mha"},
+        {2048,  8, 8, 64,  "2k-mha"},
+        {4096,  8, 2, 64,  "4k-gqa-4x"},
+        {4096,  16, 8, 128, "4k-gqa-2x-d128"},
+        {8192,  8, 8, 64,  "8k-mha"},
+    };
+    for (const auto& tc : cases) {
+        run_v2_parity_case(tc);
+    }
+}
+
 int main() {
     printf("=== gollmgo paged attention correctness tests ===\n");
     test_paged_vs_naive();
     test_v2_vs_v1();
+    test_v2_parity_sweep();
     printf("=== %s (%d failures) ===\n", failures ? "FAILED" : "ALL PASSED", failures);
     return failures ? 1 : 0;
 }

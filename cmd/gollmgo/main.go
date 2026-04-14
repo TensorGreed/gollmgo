@@ -146,6 +146,12 @@ func cmdServe(args []string) {
 		Log:               log,
 		EnablePrefixCache: cfg.PrefixCaching,
 		MaxPrefixBlocks:   cfg.PrefixCacheMaxBlocks,
+		Speculative: engine.SpeculativeSettings{
+			Enabled:        cfg.Speculative.Enabled,
+			NGramSize:      cfg.Speculative.NGramSize,
+			NumDraftTokens: cfg.Speculative.NumDraftTokens,
+			KillThreshold:  cfg.Speculative.KillThreshold,
+		},
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())

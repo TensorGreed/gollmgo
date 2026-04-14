@@ -14,6 +14,18 @@ import (
 	"github.com/TensorGreed/gollmgo/internal/scheduler"
 )
 
+// SpeculativeSettings configures engine-level speculative decoding (M6).
+// Drafting only runs on DECODE sequences with enough history; prefill is
+// unaffected. When the running acceptance rate falls below KillThreshold
+// the drafter is disabled for the rest of the process lifetime.
+type SpeculativeSettings struct {
+	Enabled        bool
+	NGramSize      int     // window used by the n-gram drafter (default 3)
+	NumDraftTokens int     // max drafts per step (K, default 4)
+	KillThreshold  float64 // disable if acceptance rate < threshold (0 = never kill)
+	KillWarmup     int64   // min drafted tokens before the kill switch can trip
+}
+
 // ServingEngine is the production engine that runs the continuous batching loop.
 // It owns the scheduler, KV cache, and coordinates the full serving pipeline.
 type ServingEngine struct {
@@ -28,6 +40,13 @@ type ServingEngine struct {
 
 	preemptWatermark float64
 	maxPrefixBlocks  int
+
+	// Speculative decoding (M6). drafter is nil when disabled or when the
+	// backend doesn't support it. kvSwapper is the optional KV-swap capability.
+	specCfg     SpeculativeSettings
+	drafter     *NGramDrafter
+	kvSwapper   backend.KVSwapper // non-nil if runner implements KVSwapper
+	swapStore   map[uint64]backend.KVSnapshot // seqID -> snapshot while preempted
 
 	mu          sync.Mutex
 	blockTables map[uint64]*kvcache.BlockTable // seqID -> block table
@@ -53,6 +72,10 @@ type ServingEngineConfig struct {
 	// MaxPrefixBlocks caps the number of blocks the prefix cache may pin.
 	// 0 derives a default of 50% of the pool.
 	MaxPrefixBlocks int
+	// Speculative enables n-gram speculative decoding. Requires the runner
+	// to report SpeculativeDecoding capability; otherwise the engine logs a
+	// warning and leaves it disabled.
+	Speculative SpeculativeSettings
 }
 
 // NewServingEngine creates the engine. Call Start to begin the batching loop.
@@ -80,9 +103,39 @@ func NewServingEngine(cfg ServingEngineConfig) *ServingEngine {
 		log:              cfg.Log,
 		preemptWatermark: cfg.PreemptWatermark,
 		maxPrefixBlocks:  maxPrefix,
+		specCfg:          cfg.Speculative,
 		blockTables:      make(map[uint64]*kvcache.BlockTable),
 		subscribers:      make(map[uint64]chan TokenResult),
+		swapStore:        make(map[uint64]backend.KVSnapshot),
 		loopDone:         make(chan struct{}),
+	}
+	caps := cfg.Runner.Capabilities()
+	if cfg.Speculative.Enabled {
+		if !caps.SpeculativeDecoding {
+			e.log.Warn("speculative decoding requested but runner doesn't advertise it; disabling",
+				"runner", fmt.Sprintf("%T", cfg.Runner))
+			e.specCfg.Enabled = false
+		} else {
+			n := cfg.Speculative.NGramSize
+			if n < 2 {
+				n = 3
+			}
+			k := cfg.Speculative.NumDraftTokens
+			if k < 1 {
+				k = 4
+			}
+			e.drafter = NewNGramDrafter(n, k)
+			if e.specCfg.KillWarmup <= 0 {
+				e.specCfg.KillWarmup = 128
+			}
+			e.log.Info("speculative decoding enabled",
+				"n_gram_size", n, "max_drafts", k,
+				"kill_threshold", cfg.Speculative.KillThreshold)
+		}
+	}
+	if swapper, ok := cfg.Runner.(backend.KVSwapper); ok && caps.KVSwap {
+		e.kvSwapper = swapper
+		e.log.Info("KV swap capability available")
 	}
 	metrics.Global.KVCacheBlocksTotal.Store(int64(cfg.Cache.NumTotalBlocks()))
 	return e
@@ -144,17 +197,101 @@ func (e *ServingEngine) cleanupPreempted(seqIDs []uint64) {
 	defer e.mu.Unlock()
 
 	for _, seqID := range seqIDs {
-		if bt, ok := e.blockTables[seqID]; ok {
+		e.releasePreemptedLocked(seqID)
+	}
+}
+
+// releasePreemptedLocked releases KV state for a preempted sequence.
+// Behaviour is determined by the scheduler's PreemptMode:
+//   - PreemptRecompute (or no swapper available): free blocks and reset
+//     PrefillConsumed so the next admission reprocesses the prompt.
+//   - PreemptSwap (swapper available): snapshot the KV bytes to host,
+//     free the GPU blocks, and stash the snapshot in swapStore so the
+//     scheduler's SwapState carries enough info for resumption. The
+//     snapshot is restored on the next admission, keeping PrefillConsumed
+//     intact.
+//
+// Must be called with e.mu held.
+func (e *ServingEngine) releasePreemptedLocked(seqID uint64) {
+	seq := e.sched.Find(seqID)
+	bt := e.blockTables[seqID]
+
+	canSwap := e.kvSwapper != nil && seq != nil && seq.SwapState != nil && bt != nil
+	if canSwap {
+		blocks := bt.PhysicalBlocks()
+		blockIDs := make([]int32, len(blocks))
+		for i, b := range blocks {
+			blockIDs[i] = int32(b)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		snap, err := e.kvSwapper.SnapshotKV(ctx, blockIDs)
+		cancel()
+		if err != nil {
+			e.log.Warn("KV snapshot failed, falling back to recompute",
+				"seq", seqID, "err", err)
+		} else {
+			e.swapStore[seqID] = snap
+			// Free GPU blocks (host copy is now authoritative until resume).
 			bt.Free()
 			delete(e.blockTables, seqID)
-		}
-		// The current serving engine has no CPU offload path, so any
-		// preemption that releases runtime state must resume via recompute.
-		if seq := e.sched.Find(seqID); seq != nil {
-			seq.PrefillConsumed = 0
-			seq.SwapState = nil
+			return
 		}
 	}
+
+	// Recompute path (no swapper, no snapshot, or snapshot failed).
+	if bt != nil {
+		bt.Free()
+		delete(e.blockTables, seqID)
+	}
+	if seq != nil {
+		seq.PrefillConsumed = 0
+		seq.SwapState = nil
+	}
+	if snap, ok := e.swapStore[seqID]; ok {
+		_ = snap.Release()
+		delete(e.swapStore, seqID)
+	}
+}
+
+// restoreSwappedLocked brings a swap-preempted sequence back online by
+// allocating fresh blocks and copying its snapshot back into the cache.
+// On any failure it degrades the sequence to recompute and returns an
+// error. Must be called with e.mu held.
+func (e *ServingEngine) restoreSwappedLocked(seq *scheduler.Sequence) error {
+	snap, ok := e.swapStore[seq.ID]
+	if !ok {
+		return nil
+	}
+	defer func() {
+		_ = snap.Release()
+		delete(e.swapStore, seq.ID)
+	}()
+
+	bt, ok := e.blockTables[seq.ID]
+	if !ok {
+		bt = kvcache.NewBlockTable(seq.ID, e.cache)
+		e.blockTables[seq.ID] = bt
+	}
+	// Allocate the same number of blocks the snapshot captured.
+	need := snap.NumBlocks() * e.cache.BlockSize()
+	if _, err := bt.AppendN(need); err != nil {
+		return fmt.Errorf("restore alloc: %w", err)
+	}
+	blocks := bt.PhysicalBlocks()
+	blockIDs := make([]int32, len(blocks))
+	for i, b := range blocks {
+		blockIDs[i] = int32(b)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := e.kvSwapper.RestoreKV(ctx, snap, blockIDs); err != nil {
+		bt.Free()
+		delete(e.blockTables, seq.ID)
+		return fmt.Errorf("restore copy: %w", err)
+	}
+	// KV is back in place; the scheduler already preserved PrefillConsumed
+	// via its SwapState, so the next Tick resumes at the right offset.
+	return nil
 }
 
 func (e *ServingEngine) runStep(ctx context.Context, schedOut *scheduler.SchedulerOutput) error {
@@ -170,6 +307,17 @@ func (e *ServingEngine) runStep(ctx context.Context, schedOut *scheduler.Schedul
 		batch.SequenceIDs = append(batch.SequenceIDs, seq.ID)
 		isPrefill := seq.State == scheduler.SeqPrefilling
 		batch.IsPrefill = append(batch.IsPrefill, isPrefill)
+
+		// Restore KV from a swap snapshot if we preempted this sequence
+		// earlier and the snapshot is still pending restore. If restore
+		// fails, fall through to recompute (empty block table).
+		if _, pending := e.swapStore[seq.ID]; pending {
+			if err := e.restoreSwappedLocked(seq); err != nil {
+				e.log.Warn("KV swap restore failed, falling back to recompute",
+					"seq", seq.ID, "err", err)
+				seq.PrefillConsumed = 0
+			}
+		}
 
 		bt, ok := e.blockTables[seq.ID]
 		if !ok {
@@ -215,6 +363,12 @@ func (e *ServingEngine) runStep(ctx context.Context, schedOut *scheduler.Schedul
 			seq.PrefillConsumed += chunk
 			batch.SeqTokenCounts = append(batch.SeqTokenCounts, int32(chunk))
 		} else {
+			// Decode step. If speculative decoding is enabled and the
+			// drafter can produce candidates, also request K draft
+			// positions in this forward pass (tree-verification via the
+			// Verify helper).
+			drafts := e.maybeDraft(seq)
+
 			slot, err := bt.Append()
 			if err != nil {
 				e.mu.Unlock()
@@ -224,7 +378,27 @@ func (e *ServingEngine) runStep(ctx context.Context, schedOut *scheduler.Schedul
 			batch.TokenIDs = append(batch.TokenIDs, seq.TokenIDs[lastPos])
 			batch.Positions = append(batch.Positions, int32(lastPos))
 			batch.SlotMapping = append(batch.SlotMapping, slot)
-			batch.SeqTokenCounts = append(batch.SeqTokenCounts, 1)
+
+			for di, d := range drafts {
+				slot, err := bt.Append()
+				if err != nil {
+					e.mu.Unlock()
+					return fmt.Errorf("draft block alloc for seq %d: %w", seq.ID, err)
+				}
+				batch.TokenIDs = append(batch.TokenIDs, d)
+				batch.Positions = append(batch.Positions, int32(lastPos+1+di))
+				batch.SlotMapping = append(batch.SlotMapping, slot)
+			}
+
+			batch.SeqTokenCounts = append(batch.SeqTokenCounts, int32(1+len(drafts)))
+			// Lazy-initialize DraftTokens on first speculating sequence.
+			if len(drafts) > 0 && batch.DraftTokens == nil {
+				batch.DraftTokens = make([][]int32, len(seqs))
+			}
+			if batch.DraftTokens != nil {
+				// index into DraftTokens matches seqs index; we're iterating in order.
+				batch.DraftTokens[len(batch.SeqTokenCounts)-1] = drafts
+			}
 		}
 
 		// Per-sequence context length and full slot table.
@@ -254,45 +428,18 @@ func (e *ServingEngine) runStep(ctx context.Context, schedOut *scheduler.Schedul
 			continue
 		}
 
-		tokenID := e.sampler.Sample(output.Logits[i])
-		now := time.Now()
-		seq.AppendToken(tokenID)
-		metrics.Global.TokensGenerated.Add(1)
+		var drafts []int32
+		if batch.DraftTokens != nil {
+			drafts = batch.DraftTokens[i]
+		}
 
-		if seq.State == scheduler.SeqPrefilling {
-			// Prefill complete — record TTFT and transition to decode.
-			ttftMs := float64(now.Sub(seq.CreatedAt).Microseconds()) / 1000.0
-			metrics.Global.TTFT.Record(ttftMs)
-			seq.Transition(scheduler.SeqDecoding)
-			seq.LastTokenAt = now
+		if len(drafts) > 0 {
+			e.emitSpeculative(seq, output, i, drafts)
 		} else {
-			// Decode step — record ITL.
-			if !seq.LastTokenAt.IsZero() {
-				itlMs := float64(now.Sub(seq.LastTokenAt).Microseconds()) / 1000.0
-				metrics.Global.ITL.Record(itlMs)
-			}
-			seq.LastTokenAt = now
+			e.emitStandard(seq, output.Logits[i])
 		}
 
-		finished := tokenID == e.eosID || seq.GeneratedLen >= seq.MaxTokens
-		if finished {
-			seq.Transition(scheduler.SeqFinished)
-		}
-
-		result := TokenResult{
-			SequenceID: seq.ID,
-			TokenID:    tokenID,
-			Finished:   finished,
-		}
-
-		if ch, ok := e.subscribers[seq.ID]; ok {
-			select {
-			case ch <- result:
-			default:
-			}
-		}
-
-		if finished {
+		if seq.IsFinished() {
 			e.cleanupSequence(seq.ID)
 		}
 	}
@@ -300,6 +447,185 @@ func (e *ServingEngine) runStep(ctx context.Context, schedOut *scheduler.Schedul
 	used := int64(e.cache.NumTotalBlocks() - e.cache.NumFreeBlocks())
 	metrics.Global.KVCacheBlocksUsed.Store(used)
 	return nil
+}
+
+// emitStandard handles a non-speculative decode or prefill-completion step.
+// Must be called with e.mu held.
+func (e *ServingEngine) emitStandard(seq *scheduler.Sequence, logits []float32) {
+	tokenID := e.sampler.Sample(logits)
+	now := time.Now()
+	seq.AppendToken(tokenID)
+	metrics.Global.TokensGenerated.Add(1)
+
+	if seq.State == scheduler.SeqPrefilling {
+		ttftMs := float64(now.Sub(seq.CreatedAt).Microseconds()) / 1000.0
+		metrics.Global.TTFT.Record(ttftMs)
+		seq.Transition(scheduler.SeqDecoding)
+		seq.LastTokenAt = now
+	} else {
+		if !seq.LastTokenAt.IsZero() {
+			itlMs := float64(now.Sub(seq.LastTokenAt).Microseconds()) / 1000.0
+			metrics.Global.ITL.Record(itlMs)
+		}
+		seq.LastTokenAt = now
+	}
+
+	finished := tokenID == e.eosID || seq.GeneratedLen >= seq.MaxTokens
+	if finished {
+		seq.Transition(scheduler.SeqFinished)
+	}
+
+	e.deliver(seq.ID, TokenResult{SequenceID: seq.ID, TokenID: tokenID, Finished: finished})
+}
+
+// emitSpeculative handles the verify/accept/rollback path for a speculative
+// decode step. The runner returned len(drafts)+1 logit rows; we verify the
+// drafts, truncate KV for rejected drafts, and emit (accepted+1) tokens.
+// Must be called with e.mu held.
+func (e *ServingEngine) emitSpeculative(seq *scheduler.Sequence, output *backend.StepOutput, i int, drafts []int32) {
+	var posLogits [][]float32
+	if len(output.LogitsPerPosition) > i {
+		posLogits = output.LogitsPerPosition[i]
+	}
+	if len(posLogits) == 0 {
+		// Runner accepted drafts but returned no per-position logits —
+		// fall back to standard path and truncate all draft slots.
+		e.log.Warn("runner returned no LogitsPerPosition despite drafts; falling back", "seq", seq.ID)
+		if bt, ok := e.blockTables[seq.ID]; ok {
+			bt.Truncate(len(drafts))
+		}
+		e.emitStandard(seq, output.Logits[i])
+		return
+	}
+
+	// Verify: draftLogits covers positions 0..K-1; posLogits[K] (if present)
+	// is the "bonus" prediction used when every draft is accepted.
+	draftLogits := posLogits
+	if len(draftLogits) > len(drafts) {
+		draftLogits = draftLogits[:len(drafts)]
+	}
+	accepted, corrected := Verify(drafts, draftLogits)
+
+	metrics.Global.SpecDraftTokens.Add(int64(len(drafts)))
+	metrics.Global.SpecAcceptedTokens.Add(int64(accepted))
+	e.maybeTripKillSwitch()
+
+	now := time.Now()
+	// The first sampled token at the "current" position is always determined
+	// by what the target model chose at position 0. If draft[0] matched, that
+	// IS what the target chose (verify guarantees argmax match); otherwise
+	// we use corrected. Either way, emit exactly `accepted+1` tokens.
+	emitToken := func(tok int32) bool {
+		seq.AppendToken(tok)
+		metrics.Global.TokensGenerated.Add(1)
+		if seq.State == scheduler.SeqPrefilling {
+			// Speculative only runs in decode, but handle completeness.
+			ttftMs := float64(now.Sub(seq.CreatedAt).Microseconds()) / 1000.0
+			metrics.Global.TTFT.Record(ttftMs)
+			seq.Transition(scheduler.SeqDecoding)
+		} else if !seq.LastTokenAt.IsZero() {
+			itlMs := float64(now.Sub(seq.LastTokenAt).Microseconds()) / 1000.0
+			metrics.Global.ITL.Record(itlMs)
+		}
+		seq.LastTokenAt = now
+		finished := tok == e.eosID || seq.GeneratedLen >= seq.MaxTokens
+		if finished {
+			seq.Transition(scheduler.SeqFinished)
+		}
+		e.deliver(seq.ID, TokenResult{SequenceID: seq.ID, TokenID: tok, Finished: finished})
+		return finished
+	}
+
+	stop := false
+	// Accepted drafts — these are exactly the tokens the target chose at
+	// positions 0..accepted-1.
+	for j := 0; j < accepted && !stop; j++ {
+		stop = emitToken(drafts[j])
+	}
+	if !stop {
+		if accepted < len(drafts) {
+			// Rejection: emit corrected token at position `accepted`.
+			stop = emitToken(corrected)
+		} else if len(posLogits) > len(drafts) {
+			// All drafts accepted — sample the bonus token from the last
+			// position's logits for one extra free token.
+			bonus := e.sampler.Sample(posLogits[len(drafts)])
+			stop = emitToken(bonus)
+		}
+	}
+
+	// Truncate KV slots that correspond to rejected drafts. The runner
+	// wrote 1 + len(drafts) slots. We've committed:
+	//   - 1 (current) + accepted (accepted drafts) + 1 (corrected or bonus)
+	// If we stopped early (EOS or MaxTokens), truncate the unused tail.
+	emitted := 1 + accepted
+	if accepted < len(drafts) {
+		emitted++ // corrected token
+	} else if len(posLogits) > len(drafts) {
+		emitted++ // bonus token
+	}
+	if stop && emitted > int(seq.GeneratedLen) {
+		// emitToken decremented via Finished; seq.GeneratedLen tracks actual.
+		emitted = int(seq.GeneratedLen)
+	}
+	totalSlotsWritten := 1 + len(drafts)
+	// Slots that hold valid KV: the current token + accepted drafts.
+	// (corrected/bonus token has NO KV yet; next step will write it.)
+	validSlots := 1 + accepted
+	toTruncate := totalSlotsWritten - validSlots
+	if toTruncate > 0 {
+		if bt, ok := e.blockTables[seq.ID]; ok {
+			bt.Truncate(toTruncate)
+		}
+	}
+	_ = emitted
+}
+
+// deliver pushes a TokenResult onto the subscriber channel, non-blocking.
+// Must be called with e.mu held.
+func (e *ServingEngine) deliver(seqID uint64, result TokenResult) {
+	if ch, ok := e.subscribers[seqID]; ok {
+		select {
+		case ch <- result:
+		default:
+		}
+	}
+}
+
+// maybeDraft returns up to K draft tokens for a decoding sequence when
+// speculative decoding is enabled and the kill switch hasn't tripped.
+func (e *ServingEngine) maybeDraft(seq *scheduler.Sequence) []int32 {
+	if e.drafter == nil || !e.specCfg.Enabled {
+		return nil
+	}
+	if metrics.Global.SpecKillActive.Load() == 1 {
+		return nil
+	}
+	// Need enough history to form n-grams. History = prompt + generated.
+	if len(seq.TokenIDs) < e.drafter.N {
+		return nil
+	}
+	return e.drafter.Draft(seq.TokenIDs)
+}
+
+// maybeTripKillSwitch checks the running acceptance rate and disables
+// future drafting process-wide if it falls below the configured threshold.
+func (e *ServingEngine) maybeTripKillSwitch() {
+	if e.specCfg.KillThreshold <= 0 {
+		return
+	}
+	drafted := metrics.Global.SpecDraftTokens.Load()
+	if drafted < e.specCfg.KillWarmup {
+		return
+	}
+	if metrics.Global.SpecAcceptanceRate() < e.specCfg.KillThreshold {
+		if metrics.Global.SpecKillActive.CompareAndSwap(0, 1) {
+			e.log.Warn("speculative decoding kill switch tripped",
+				"acceptance_rate", metrics.Global.SpecAcceptanceRate(),
+				"threshold", e.specCfg.KillThreshold,
+				"drafted", drafted)
+		}
+	}
 }
 
 // recoverFromStepFailure handles sequences that were in-flight when
@@ -360,6 +686,11 @@ func (e *ServingEngine) Stop() error {
 		close(ch)
 		delete(e.subscribers, id)
 	}
+	// Release any outstanding KV snapshots to avoid leaking host buffers.
+	for id, snap := range e.swapStore {
+		_ = snap.Release()
+		delete(e.swapStore, id)
+	}
 	e.mu.Unlock()
 
 	<-e.loopDone
@@ -406,18 +737,24 @@ func (e *ServingEngine) checkMemoryPressure() {
 		"victim_blocks", victimBlocks,
 		"mode", e.sched.PreemptMode())
 
-	if bt, ok := e.blockTables[victimID]; ok {
-		bt.Free()
-		delete(e.blockTables, victimID)
-	}
+	// Decide early whether we can honor swap mode end-to-end. If the runner
+	// exposes a KVSwapper and the scheduler is in swap mode, try to
+	// snapshot the victim's KV to host before freeing its blocks. Otherwise,
+	// force recompute so freed blocks aren't referenced by stale SwapState.
+	useSwap := e.kvSwapper != nil && e.sched.PreemptMode() == scheduler.PreemptSwap
 
-	// We've freed the victim's KV blocks without copying them to host memory,
-	// so true swap-resume is not possible from the engine side. Force the
-	// scheduler to treat this as a recompute even if PreemptMode is Swap.
-	if seq := e.sched.Find(victimID); seq != nil {
-		seq.PrefillConsumed = 0
-		seq.SwapState = nil
+	if !useSwap {
+		if bt, ok := e.blockTables[victimID]; ok {
+			bt.Free()
+			delete(e.blockTables, victimID)
+		}
+		if seq := e.sched.Find(victimID); seq != nil {
+			seq.PrefillConsumed = 0
+			seq.SwapState = nil
+		}
 	}
+	// In swap mode, defer block cleanup to releasePreemptedLocked, which
+	// runs after sched.Preempt stamps the sequence's SwapState.
 
 	if err := e.sched.Preempt(victimID); err != nil {
 		// Preempt may fail if the sequence already finished mid-step.
@@ -437,9 +774,16 @@ func (e *ServingEngine) checkMemoryPressure() {
 			delete(e.subscribers, victimID)
 		}
 		e.sched.Complete(victimID)
+		return
 	}
-	// On success: subscriber stays open. The sequence will be re-admitted
-	// by a later Tick and continue streaming through the same channel.
+	// Preempt succeeded. In swap mode, snapshot KV now (the scheduler has
+	// already stamped SwapState via applyPreemption). On snapshot failure
+	// releasePreemptedLocked falls back to recompute transparently.
+	if useSwap {
+		e.releasePreemptedLocked(victimID)
+	}
+	// Subscriber stays open; the sequence will be re-admitted by a later
+	// Tick and continue streaming through the same channel.
 }
 
 func (e *ServingEngine) cleanupSequence(seqID uint64) {
@@ -454,6 +798,11 @@ func (e *ServingEngine) cleanupSequence(seqID uint64) {
 		}
 		bt.Free()
 		delete(e.blockTables, seqID)
+	}
+	// If we were holding a swap snapshot for this sequence, release it.
+	if snap, ok := e.swapStore[seqID]; ok {
+		_ = snap.Release()
+		delete(e.swapStore, seqID)
 	}
 	if ch, ok := e.subscribers[seqID]; ok {
 		close(ch)

@@ -85,6 +85,14 @@ func (r *CUDARunner) Capabilities() backend.Capabilities {
 		FP8:            fp8,
 		INT8:           fp8, // INT8 also widely supported, gate same as FP8 for simplicity
 		PagedAttention: true,
+		// SpeculativeDecoding requires multi-position decode dispatch in Step,
+		// which is blocked on Epic 1 M5 (CUDARunner.Step). Advertise false
+		// until the backend actually evaluates K+1 positions per sequence.
+		SpeculativeDecoding: false,
+		// KVSwap requires host-pinned buffers + cudaMemcpyAsync between the
+		// device KV cache and host. See SnapshotKV/RestoreKV below for the
+		// CGo surface; the Go-side engine wiring is complete.
+		KVSwap: false,
 	}
 }
 
@@ -106,6 +114,23 @@ func (r *CUDARunner) DeviceInfo() backend.DeviceInfo {
 
 // Ensure CUDARunner satisfies the Runner interface at compile time.
 var _ backend.Runner = (*CUDARunner)(nil)
+
+// SnapshotKV is a placeholder for the GPU→host KV copy. Implementation is
+// tracked under Epic 2 M7 follow-up: allocate a pinned host buffer, issue
+// cudaMemcpyAsync for each block's K and V regions, return a snapshot handle
+// holding the buffer. Not exposed via Capabilities.KVSwap until this is real.
+func (r *CUDARunner) SnapshotKV(_ context.Context, _ []int32) (backend.KVSnapshot, error) {
+	return nil, fmt.Errorf("cuda: SnapshotKV not yet implemented (Epic 2 M7 follow-up)")
+}
+
+// RestoreKV is a placeholder for the host→GPU KV copy. See SnapshotKV.
+func (r *CUDARunner) RestoreKV(_ context.Context, _ backend.KVSnapshot, _ []int32) error {
+	return fmt.Errorf("cuda: RestoreKV not yet implemented (Epic 2 M7 follow-up)")
+}
+
+// Compile-time check that the CUDA runner exposes the KV-swap interface
+// (even though Capabilities.KVSwap is still false until the copies work).
+var _ backend.KVSwapper = (*CUDARunner)(nil)
 
 // Prevent unused import of unsafe.
 var _ = unsafe.Pointer(nil)

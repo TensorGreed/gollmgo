@@ -40,6 +40,10 @@ test-paged-attn: kernels
 		$(CUDA_LIBS)
 	$(BUILD_DIR)/paged_attn_test
 
+# Alias that emphasises this is the M2 parity gate — runs the same binary
+# but under a name that matches docs and CI job names.
+test-paged-attn-parity: test-paged-attn
+
 kernels: $(LIB_BACKEND) $(LIB_OPS) $(LIB_MODEL) $(LIB_PAGED_ATTN) $(LIB_KVCACHE)
 
 $(LIB_BACKEND): $(KERNEL_DIR)/gollmgo_backend.cu $(KERNEL_DIR)/gollmgo_backend.h

@@ -91,12 +91,25 @@ func (c *Config) Validate() error {
 		return ErrAutoPreemptRequiresPrio
 	}
 	switch strings.ToLower(strings.TrimSpace(c.PreemptMode)) {
-	case "", "recompute":
+	case "", "recompute", "swap":
 	default:
 		return ErrInvalidPreemptMode
 	}
 	if c.Speculative.Enabled {
-		return ErrSpeculativeUnsupported
+		switch strings.ToLower(strings.TrimSpace(c.Speculative.Mode)) {
+		case "", "ngram":
+			// draft mode is reserved for future work (needs a draft model).
+		case "draft":
+			// Accepted syntactically; engine may gate on runner capability.
+		default:
+			return ErrInvalidSpeculativeMode
+		}
+		if c.Speculative.NGramSize < 0 {
+			return ErrInvalidNGramSize
+		}
+		if c.Speculative.NumDraftTokens < 0 {
+			return ErrInvalidNumDraftTokens
+		}
 	}
 	return nil
 }

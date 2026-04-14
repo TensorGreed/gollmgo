@@ -62,9 +62,14 @@ func TestValidateSchedulerPolicy(t *testing.T) {
 
 func TestValidatePreemptMode(t *testing.T) {
 	c := DefaultConfig()
+	// Swap is now a valid mode (backend support is discovered at runtime).
 	c.PreemptMode = "swap"
+	if err := c.Validate(); err != nil {
+		t.Fatalf("expected swap mode to validate, got %v", err)
+	}
+	c.PreemptMode = "bogus"
 	if !errors.Is(c.Validate(), ErrInvalidPreemptMode) {
-		t.Fatal("expected ErrInvalidPreemptMode")
+		t.Fatal("expected ErrInvalidPreemptMode for unknown mode")
 	}
 }
 
@@ -85,10 +90,24 @@ func TestValidatePrefixCacheCap(t *testing.T) {
 	}
 }
 
-func TestValidateSpeculativeUnsupported(t *testing.T) {
+func TestValidateSpeculativeEnabled(t *testing.T) {
+	// Enabled speculative decoding is accepted; the engine activates it only
+	// when the runner reports SpeculativeDecoding capability.
 	c := DefaultConfig()
 	c.Speculative.Enabled = true
-	if !errors.Is(c.Validate(), ErrSpeculativeUnsupported) {
-		t.Fatal("expected ErrSpeculativeUnsupported")
+	c.Speculative.Mode = "ngram"
+	c.Speculative.NGramSize = 3
+	c.Speculative.NumDraftTokens = 4
+	if err := c.Validate(); err != nil {
+		t.Fatalf("expected enabled ngram speculative to validate, got %v", err)
+	}
+}
+
+func TestValidateSpeculativeModeRejected(t *testing.T) {
+	c := DefaultConfig()
+	c.Speculative.Enabled = true
+	c.Speculative.Mode = "bogus"
+	if !errors.Is(c.Validate(), ErrInvalidSpeculativeMode) {
+		t.Fatal("expected ErrInvalidSpeculativeMode")
 	}
 }
