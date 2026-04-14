@@ -28,12 +28,6 @@ jobs:
             ./internal/scheduler/... \
             ./internal/kvcache/... \
             ./internal/benchcheck/... | tee bench_current.txt
-      - name: Self-test regression checker against placeholder baseline
-        run: |
-          go run ./internal/benchcheck/cmd \
-            --baseline bench/baseline_result.json \
-            --current  bench/baseline_result.json \
-            --thresholds bench/thresholds.json
       - name: Upload benchmark output
         uses: actions/upload-artifact@v4
         with:
@@ -55,20 +49,22 @@ jobs:
         run: make build
       - name: Start gollmgo server
         run: |
+          : "${GOLLMGO_BENCH_MODEL_PATH:?Set GOLLMGO_BENCH_MODEL_PATH on the GPU runner to a local model directory or weights file}"
           mkdir -p bench/results
           nohup bin/gollmgo serve \
             --config bench/baseline_config.json \
+            --model "$GOLLMGO_BENCH_MODEL_PATH" \
             > bench/results/server.log 2>&1 &
           echo $! > bench/results/server.pid
-          # Wait for /healthz (or up to 60s).
+          # Wait for readiness (or up to 60s).
           for i in $(seq 1 60); do
-            if curl -fsS http://localhost:8080/healthz >/dev/null 2>&1; then
+            if curl -fsS http://localhost:8080/health/ready >/dev/null 2>&1; then
               echo "server is up"
               break
             fi
             sleep 1
           done
-          curl -fsS http://localhost:8080/healthz
+          curl -fsS http://localhost:8080/health/ready
       - name: Run serving benchmark
         run: |
           bin/gollmgo bench --mode serving \

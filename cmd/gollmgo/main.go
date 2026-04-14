@@ -138,12 +138,14 @@ func cmdServe(args []string) {
 
 	// Create serving engine.
 	eng := engine.NewServingEngine(engine.ServingEngineConfig{
-		Runner:    runner,
-		Scheduler: sched,
-		Cache:     cache,
-		Tokenizer: tokenizer,
-		Sampling:  engine.DefaultSamplingParams(),
-		Log:       log,
+		Runner:            runner,
+		Scheduler:         sched,
+		Cache:             cache,
+		Tokenizer:         tokenizer,
+		Sampling:          engine.DefaultSamplingParams(),
+		Log:               log,
+		EnablePrefixCache: cfg.PrefixCaching,
+		MaxPrefixBlocks:   cfg.PrefixCacheMaxBlocks,
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -187,11 +189,11 @@ func cmdServe(args []string) {
 // benchConfig holds frozen benchmark parameters loaded from --config.
 type benchConfig struct {
 	Benchmark struct {
-		Mode       string `json:"mode"`
-		NumPrompts int    `json:"num_prompts"`
-		PromptLen  int    `json:"prompt_len"`
-		OutputLen  int    `json:"output_len"`
-		Concurrency int   `json:"concurrency"`
+		Mode        string `json:"mode"`
+		NumPrompts  int    `json:"num_prompts"`
+		PromptLen   int    `json:"prompt_len"`
+		OutputLen   int    `json:"output_len"`
+		Concurrency int    `json:"concurrency"`
 	} `json:"benchmark"`
 }
 

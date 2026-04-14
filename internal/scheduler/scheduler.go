@@ -7,6 +7,9 @@ import "context"
 type SchedulerOutput struct {
 	// ScheduledSequences are the sequences selected for this step.
 	ScheduledSequences []*Sequence
+	// PreemptedSequenceIDs are active sequences evicted during this tick.
+	// The engine uses this to release or preserve runtime state coherently.
+	PreemptedSequenceIDs []uint64
 	// PrefillBudgetUsed is the number of prefill tokens in this batch.
 	PrefillBudgetUsed int
 	// DecodeBudgetUsed is the number of decode tokens in this batch.

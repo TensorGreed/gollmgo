@@ -38,6 +38,7 @@ var testThresholds = []byte(`{
 // 10ms TTFT P50, 7ms ITL P50, 0.5% error rate (5 errors / 1000 prompts).
 func baseline() []byte {
 	return []byte(`{
+		"placeholder": false,
 		"num_prompts": 1000,
 		"error_count": 5,
 		"tokens_per_second": 1000,
@@ -162,5 +163,18 @@ func TestCheckReportFormatting(t *testing.T) {
 	}
 	if !strings.Contains(s, "tokens_per_second") {
 		t.Error("missing throughput metric in output")
+	}
+}
+
+func TestCheckRejectsPlaceholderBaseline(t *testing.T) {
+	placeholder := []byte(`{
+		"placeholder": true,
+		"num_prompts": 1,
+		"error_count": 0,
+		"tokens_per_second": 1
+	}`)
+	_, err := CheckBytes(placeholder, baseline(), testThresholds)
+	if err == nil || !strings.Contains(err.Error(), "placeholder") {
+		t.Fatalf("expected placeholder baseline error, got %v", err)
 	}
 }

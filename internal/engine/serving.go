@@ -31,19 +31,19 @@ type ServingEngine struct {
 
 	mu          sync.Mutex
 	blockTables map[uint64]*kvcache.BlockTable // seqID -> block table
-	subscribers map[uint64]chan TokenResult     // seqID -> token delivery channel
+	subscribers map[uint64]chan TokenResult    // seqID -> token delivery channel
 	stopped     bool
 	loopDone    chan struct{}
 }
 
 // ServingEngineConfig holds configuration for the serving engine.
 type ServingEngineConfig struct {
-	Runner      backend.Runner
-	Scheduler   scheduler.Scheduler
-	Cache       *kvcache.BlockPool
-	Tokenizer   model.Tokenizer
-	Sampling    SamplingParams
-	Log         *slog.Logger
+	Runner    backend.Runner
+	Scheduler scheduler.Scheduler
+	Cache     *kvcache.BlockPool
+	Tokenizer model.Tokenizer
+	Sampling  SamplingParams
+	Log       *slog.Logger
 	// PreemptWatermark is the fraction of cache utilization above which
 	// the engine preempts the longest decode sequence to free blocks.
 	// 0 disables preemption. Default: 0.95.
@@ -119,6 +119,10 @@ func (e *ServingEngine) loop(ctx context.Context) {
 			continue
 		}
 
+		if len(out.PreemptedSequenceIDs) > 0 {
+			e.cleanupPreempted(out.PreemptedSequenceIDs)
+		}
+
 		// Update scheduler queue metrics after each tick.
 		metrics.Global.SchedulerQueueDepth.Store(int64(e.sched.WaitingLen()))
 		metrics.Global.SchedulerActiveCount.Store(int64(e.sched.ActiveLen()))
@@ -131,6 +135,24 @@ func (e *ServingEngine) loop(ctx context.Context) {
 		if err := e.runStep(ctx, out); err != nil {
 			e.log.Error("step failed, recovering sequences", "error", err)
 			e.recoverFromStepFailure(out.ScheduledSequences)
+		}
+	}
+}
+
+func (e *ServingEngine) cleanupPreempted(seqIDs []uint64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	for _, seqID := range seqIDs {
+		if bt, ok := e.blockTables[seqID]; ok {
+			bt.Free()
+			delete(e.blockTables, seqID)
+		}
+		// The current serving engine has no CPU offload path, so any
+		// preemption that releases runtime state must resume via recompute.
+		if seq := e.sched.Find(seqID); seq != nil {
+			seq.PrefillConsumed = 0
+			seq.SwapState = nil
 		}
 	}
 }

@@ -513,4 +513,73 @@ func TestServingEngineMixedPrefillDecode(t *testing.T) {
 	}
 }
 
+func TestServingEnginePriorityAutoPreemptReleasesRuntimeState(t *testing.T) {
+	sched := scheduler.NewPriorityScheduler(scheduler.SchedulerConfig{
+		MaxBatchSize:     1,
+		MaxTokenBudget:   100,
+		MaxQueueDepth:    16,
+		PrefillChunkSize: 16,
+		AutoPreempt:      true,
+		PreemptMode:      scheduler.PreemptRecompute,
+	})
+	cache := kvcache.NewBlockPool(16, 4)
+	tok := &model.MockTokenizer{Vocab: 100, EOS: 2}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	eng := NewServingEngine(ServingEngineConfig{
+		Runner:    &backend.MockRunner{},
+		Scheduler: sched,
+		Cache:     cache,
+		Tokenizer: tok,
+		Sampling:  SamplingParams{Temperature: 0},
+		Log:       log,
+	})
+
+	low := scheduler.NewSequence("low", []int32{1, 2, 3, 4}, 10)
+	low.Priority = 1
+	if err := sched.Add(low); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sched.Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := low.Transition(scheduler.SeqDecoding); err != nil {
+		t.Fatal(err)
+	}
+	low.AppendToken(99)
+	low.PrefillConsumed = low.PromptLen
+
+	bt := kvcache.NewBlockTable(low.ID, cache)
+	if _, err := bt.AppendN(low.TotalLen()); err != nil {
+		t.Fatal(err)
+	}
+	eng.blockTables[low.ID] = bt
+
+	high := scheduler.NewSequence("high", []int32{7, 8}, 10)
+	high.Priority = 10
+	if err := sched.Add(high); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := sched.Tick(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.PreemptedSequenceIDs) != 1 || out.PreemptedSequenceIDs[0] != low.ID {
+		t.Fatalf("expected low seq to be preempted, got %v", out.PreemptedSequenceIDs)
+	}
+
+	eng.cleanupPreempted(out.PreemptedSequenceIDs)
+
+	if _, ok := eng.blockTables[low.ID]; ok {
+		t.Fatal("expected preempted sequence block table to be released")
+	}
+	if low.PrefillConsumed != 0 {
+		t.Fatalf("expected preempted sequence to restart from recompute, got prefill=%d", low.PrefillConsumed)
+	}
+	if low.SwapState != nil {
+		t.Fatal("expected swap state to be cleared when runtime state is released")
+	}
+}
+
 func ctx() context.Context { return context.Background() }

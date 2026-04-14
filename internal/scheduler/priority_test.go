@@ -81,16 +81,17 @@ func TestPriorityAutoPreempt(t *testing.T) {
 	high.Priority = 10
 	sched.Add(high)
 
-	// low should have been preempted back to waiting.
+	// Auto-preempt happens on Tick so the engine can release runtime state coherently.
+	out, _ := sched.Tick(context.Background())
 	if low.State != SeqWaiting {
 		t.Fatalf("expected low to be WAITING (preempted), got %s", low.State)
 	}
-	if sched.ActiveLen() != 0 {
-		t.Fatalf("expected 0 active after auto-preempt, got %d", sched.ActiveLen())
+	if sched.ActiveLen() != 1 {
+		t.Fatalf("expected 1 active after re-admitting high, got %d", sched.ActiveLen())
 	}
-
-	// Next tick: high should be admitted.
-	out, _ := sched.Tick(context.Background())
+	if len(out.PreemptedSequenceIDs) != 1 || out.PreemptedSequenceIDs[0] != low.ID {
+		t.Fatalf("expected preempted IDs [%d], got %v", low.ID, out.PreemptedSequenceIDs)
+	}
 	admitted := false
 	for _, s := range out.ScheduledSequences {
 		if s.ID == high.ID {
@@ -124,8 +125,12 @@ func TestPriorityNoAutoPreemptWhenDisabled(t *testing.T) {
 	sched.Add(high)
 
 	// low should NOT have been preempted.
+	out, _ := sched.Tick(context.Background())
 	if low.State != SeqDecoding {
 		t.Fatalf("expected low to remain DECODING, got %s", low.State)
+	}
+	if len(out.PreemptedSequenceIDs) != 0 {
+		t.Fatalf("expected no preemptions, got %v", out.PreemptedSequenceIDs)
 	}
 	if sched.ActiveLen() != 1 {
 		t.Fatalf("expected 1 active, got %d", sched.ActiveLen())

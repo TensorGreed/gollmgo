@@ -53,8 +53,8 @@ func (r *Report) String() string {
 
 // Thresholds is the top-level threshold config.
 type Thresholds struct {
-	Description string                       `json:"description"`
-	Thresholds  map[string]MetricThreshold   `json:"thresholds"`
+	Description string                     `json:"description"`
+	Thresholds  map[string]MetricThreshold `json:"thresholds"`
 }
 
 // MetricThreshold defines limits for a single metric.
@@ -69,6 +69,7 @@ type MetricThreshold struct {
 // metrics at the top level (not nested under "metrics"). Unknown fields are
 // ignored so this stays forward-compatible with new metrics.
 type BaselineResult struct {
+	Placeholder     bool    `json:"placeholder"`
 	NumPrompts      int     `json:"num_prompts"`
 	ErrorCount      int     `json:"error_count"`
 	TokensPerSecond float64 `json:"tokens_per_second"`
@@ -88,18 +89,18 @@ type BaselineResult struct {
 // (error_rate_pct). Names match the keys used in thresholds.json.
 func (r BaselineResult) metricsMap() map[string]float64 {
 	m := map[string]float64{
-		"tokens_per_second":  r.TokensPerSecond,
+		"tokens_per_second":   r.TokensPerSecond,
 		"requests_per_second": r.RequestsPerSec,
-		"ttft_p50_ms":        r.TTFTP50Ms,
-		"ttft_p95_ms":        r.TTFTP95Ms,
-		"ttft_p99_ms":        r.TTFTP99Ms,
-		"itl_p50_ms":         r.ITLP50Ms,
-		"itl_p95_ms":         r.ITLP95Ms,
-		"itl_p99_ms":         r.ITLP99Ms,
-		"e2e_p50_ms":         r.E2EP50Ms,
-		"e2e_p95_ms":         r.E2EP95Ms,
-		"e2e_p99_ms":         r.E2EP99Ms,
-		"error_count":        float64(r.ErrorCount),
+		"ttft_p50_ms":         r.TTFTP50Ms,
+		"ttft_p95_ms":         r.TTFTP95Ms,
+		"ttft_p99_ms":         r.TTFTP99Ms,
+		"itl_p50_ms":          r.ITLP50Ms,
+		"itl_p95_ms":          r.ITLP95Ms,
+		"itl_p99_ms":          r.ITLP99Ms,
+		"e2e_p50_ms":          r.E2EP50Ms,
+		"e2e_p95_ms":          r.E2EP95Ms,
+		"e2e_p99_ms":          r.E2EP99Ms,
+		"error_count":         float64(r.ErrorCount),
 	}
 	if r.NumPrompts > 0 {
 		m["error_rate_pct"] = float64(r.ErrorCount) / float64(r.NumPrompts) * 100.0
@@ -144,6 +145,9 @@ func CheckBytes(baselineData, currentData, thresholdData []byte) (*Report, error
 	report := &Report{
 		Overall:   VerdictPass,
 		Timestamp: time.Now().UTC(),
+	}
+	if baseline.Placeholder {
+		return nil, fmt.Errorf("baseline is a placeholder; replace bench/baseline_result.json with a real benchmark capture before running regression checks")
 	}
 
 	baseMetrics := baseline.metricsMap()

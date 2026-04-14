@@ -1,6 +1,8 @@
 // Package config provides configuration loading and validation for gollmgo.
 package config
 
+import "strings"
+
 // Config holds all server configuration.
 type Config struct {
 	// Server settings.
@@ -17,12 +19,14 @@ type Config struct {
 	MaxQueueDepth    int    `json:"max_queue_depth"`
 	PrefillChunkSize int    `json:"prefill_chunk_size"`
 	SchedulerPolicy  string `json:"scheduler_policy"` // "fcfs" (default), "sjf", "priority"
-	PreemptMode      string `json:"preempt_mode"`      // "recompute" (default), "swap"
-	AutoPreempt      bool   `json:"auto_preempt"`      // priority-only: high-priority arrivals preempt
+	PreemptMode      string `json:"preempt_mode"`     // "recompute" (default), "swap"
+	AutoPreempt      bool   `json:"auto_preempt"`     // priority-only: high-priority arrivals preempt
 
 	// KV cache settings.
-	BlockSize         int     `json:"block_size"`
-	MaxMemoryFraction float64 `json:"max_memory_fraction"`
+	BlockSize            int     `json:"block_size"`
+	MaxMemoryFraction    float64 `json:"max_memory_fraction"`
+	PrefixCaching        bool    `json:"prefix_caching"`
+	PrefixCacheMaxBlocks int     `json:"prefix_cache_max_blocks"`
 
 	// Quantization: "" (none), "fp8", "int8".
 	Quantization string `json:"quantization"`
@@ -38,9 +42,9 @@ type Config struct {
 type SpeculativeConfig struct {
 	Enabled        bool    `json:"enabled"`
 	Mode           string  `json:"mode"`             // "ngram" or "draft"
-	NGramSize      int     `json:"ngram_size"`        // default 3
-	NumDraftTokens int     `json:"num_draft_tokens"`  // K, default 4
-	KillThreshold  float64 `json:"kill_threshold"`    // auto-disable below this acceptance rate
+	NGramSize      int     `json:"ngram_size"`       // default 3
+	NumDraftTokens int     `json:"num_draft_tokens"` // K, default 4
+	KillThreshold  float64 `json:"kill_threshold"`   // auto-disable below this acceptance rate
 }
 
 // DefaultConfig returns a Config with production-reasonable defaults.
@@ -56,6 +60,7 @@ func DefaultConfig() Config {
 		PreemptMode:       "recompute",
 		BlockSize:         16,
 		MaxMemoryFraction: 0.9,
+		PrefixCaching:     false,
 		LogLevel:          "info",
 	}
 }
@@ -73,6 +78,25 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxMemoryFraction <= 0 || c.MaxMemoryFraction > 1.0 {
 		return ErrInvalidMemoryFraction
+	}
+	if c.PrefixCacheMaxBlocks < 0 {
+		return ErrInvalidPrefixCacheCap
+	}
+	switch strings.ToLower(strings.TrimSpace(c.SchedulerPolicy)) {
+	case "", "fcfs", "sjf", "priority":
+	default:
+		return ErrInvalidSchedulerPolicy
+	}
+	if c.AutoPreempt && strings.ToLower(strings.TrimSpace(c.SchedulerPolicy)) != "priority" {
+		return ErrAutoPreemptRequiresPrio
+	}
+	switch strings.ToLower(strings.TrimSpace(c.PreemptMode)) {
+	case "", "recompute":
+	default:
+		return ErrInvalidPreemptMode
+	}
+	if c.Speculative.Enabled {
+		return ErrSpeculativeUnsupported
 	}
 	return nil
 }

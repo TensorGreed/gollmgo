@@ -8,9 +8,10 @@ import (
 )
 
 // PriorityScheduler implements priority-based continuous batching.
-// The waiting queue is sorted by Priority (descending), with FCFS tiebreak (by ID ascending).
-// When AutoPreempt is enabled, a high-priority arrival can preempt the lowest-priority
-// active sequence to make room in the batch.
+// The waiting queue is sorted by Priority (descending), with FCFS tiebreak
+// (by ID ascending). When AutoPreempt is enabled, Tick may preempt the
+// lowest-priority active decoder before admission so the engine can release
+// runtime state coherently.
 type PriorityScheduler struct {
 	cfg SchedulerConfig
 
@@ -37,29 +38,64 @@ func (s *PriorityScheduler) Add(seq *Sequence) error {
 		return fmt.Errorf("%w: depth %d", ErrQueueFull, len(s.waiting))
 	}
 
-	// Auto-preempt: if batch is full and new sequence has higher priority than
-	// the lowest-priority active sequence, preempt that active sequence.
-	if s.cfg.AutoPreempt && len(s.active) >= s.cfg.MaxBatchSize {
-		var lowestSeq *Sequence
-		for _, act := range s.active {
-			if lowestSeq == nil || act.Priority < lowestSeq.Priority ||
-				(act.Priority == lowestSeq.Priority && act.ID > lowestSeq.ID) {
-				lowestSeq = act
-			}
-		}
-		if lowestSeq != nil && seq.Priority > lowestSeq.Priority {
-			// Preempt the lowest-priority active sequence.
-			lowestSeq.Transition(SeqPreempted)
-			applyPreemption(lowestSeq, s.cfg.PreemptMode)
-			lowestSeq.Transition(SeqWaiting)
-			delete(s.active, lowestSeq.ID)
-			s.waiting = append(s.waiting, lowestSeq)
-		}
-	}
-
 	s.waiting = append(s.waiting, seq)
 	s.all[seq.ID] = seq
 	return nil
+}
+
+func (s *PriorityScheduler) preemptLocked(seqID uint64) error {
+	seq, ok := s.active[seqID]
+	if !ok {
+		return fmt.Errorf("%w: %d", ErrSeqNotFound, seqID)
+	}
+
+	if err := seq.Transition(SeqPreempted); err != nil {
+		return err
+	}
+	applyPreemption(seq, s.cfg.PreemptMode)
+	if err := seq.Transition(SeqWaiting); err != nil {
+		return err
+	}
+
+	delete(s.active, seqID)
+	s.waiting = append(s.waiting, seq)
+	return nil
+}
+
+func (s *PriorityScheduler) lowestPreemptableLocked() *Sequence {
+	var victim *Sequence
+	for _, act := range s.active {
+		if act.State != SeqDecoding {
+			continue
+		}
+		if victim == nil || act.Priority < victim.Priority ||
+			(act.Priority == victim.Priority && act.ID > victim.ID) {
+			victim = act
+		}
+	}
+	return victim
+}
+
+func (s *PriorityScheduler) autoPreemptLocked(out *SchedulerOutput) {
+	if !s.cfg.AutoPreempt || s.cfg.MaxBatchSize <= 0 {
+		return
+	}
+	if len(s.waiting) == 0 || len(s.active) < s.cfg.MaxBatchSize {
+		return
+	}
+
+	for len(s.active) >= s.cfg.MaxBatchSize && len(s.waiting) > 0 {
+		highestWaiting := s.waiting[0]
+		victim := s.lowestPreemptableLocked()
+		if victim == nil || highestWaiting.Priority <= victim.Priority {
+			return
+		}
+		if err := s.preemptLocked(victim.ID); err != nil {
+			return
+		}
+		out.PreemptedSequenceIDs = append(out.PreemptedSequenceIDs, victim.ID)
+		s.sortWaiting()
+	}
 }
 
 func (s *PriorityScheduler) sortWaiting() {
@@ -83,6 +119,7 @@ func (s *PriorityScheduler) Tick(_ context.Context) (*SchedulerOutput, error) {
 	s.sortWaiting()
 
 	out := &SchedulerOutput{}
+	s.autoPreemptLocked(out)
 	batchSize := 0
 	tokenBudget := s.cfg.MaxTokenBudget
 	chunkSize := s.cfg.PrefillChunkSize
@@ -189,22 +226,7 @@ func (s *PriorityScheduler) Preempt(seqID uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	seq, ok := s.active[seqID]
-	if !ok {
-		return fmt.Errorf("%w: %d", ErrSeqNotFound, seqID)
-	}
-
-	if err := seq.Transition(SeqPreempted); err != nil {
-		return err
-	}
-	applyPreemption(seq, s.cfg.PreemptMode)
-	if err := seq.Transition(SeqWaiting); err != nil {
-		return err
-	}
-
-	delete(s.active, seqID)
-	s.waiting = append(s.waiting, seq)
-	return nil
+	return s.preemptLocked(seqID)
 }
 
 func (s *PriorityScheduler) Len() int {
