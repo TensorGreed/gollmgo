@@ -178,3 +178,44 @@ func TestCheckRejectsPlaceholderBaseline(t *testing.T) {
 		t.Fatalf("expected placeholder baseline error, got %v", err)
 	}
 }
+
+func TestCheckErrorRateUsesMeasuredRequestsWhenPresent(t *testing.T) {
+	baseline := []byte(`{
+		"placeholder": false,
+		"num_prompts": 1000,
+		"measured_requests": 3000,
+		"error_count": 15,
+		"tokens_per_second": 1000,
+		"ttft_p50_ms": 10, "ttft_p99_ms": 30,
+		"itl_p50_ms": 7, "itl_p99_ms": 20
+	}`)
+	current := []byte(`{
+		"num_prompts": 1000,
+		"measured_requests": 3000,
+		"error_count": 60,
+		"tokens_per_second": 1000,
+		"ttft_p50_ms": 10, "ttft_p99_ms": 30,
+		"itl_p50_ms": 7, "itl_p99_ms": 20
+	}`)
+
+	report, err := CheckBytes(baseline, current, testThresholds)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var found bool
+	for _, r := range report.Results {
+		if r.Name == "error_rate_pct" {
+			found = true
+			if r.Current != 2 {
+				t.Fatalf("expected error_rate_pct=2, got %v", r.Current)
+			}
+			if r.Verdict != VerdictFail {
+				t.Fatalf("expected error_rate_pct FAIL, got %s", r.Verdict)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("error_rate_pct metric not found")
+	}
+}

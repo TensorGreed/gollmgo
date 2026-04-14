@@ -27,9 +27,9 @@ type mergePair struct {
 // hfTokenizerJSON is the top-level structure of tokenizer.json.
 type hfTokenizerJSON struct {
 	Model struct {
-		Type   string            `json:"type"`
-		Vocab  map[string]int32  `json:"vocab"`
-		Merges []string          `json:"merges"`
+		Type   string           `json:"type"`
+		Vocab  map[string]int32 `json:"vocab"`
+		Merges []string         `json:"merges"`
 	} `json:"model"`
 	AddedTokens []struct {
 		ID      int32  `json:"id"`
@@ -96,13 +96,13 @@ func LoadHFTokenizer(path string, eosToken, bosToken string) (*HFTokenizer, erro
 	}
 
 	return &HFTokenizer{
-		vocab:      vocab,
-		invVocab:   invVocab,
-		merges:     merges,
-		eosID:      eosID,
-		bosID:      bosID,
-		vocabSize:  int(maxID + 1),
-		addBOS:     bosID >= 0, // prepend BOS if available
+		vocab:     vocab,
+		invVocab:  invVocab,
+		merges:    merges,
+		eosID:     eosID,
+		bosID:     bosID,
+		vocabSize: int(maxID + 1),
+		addBOS:    bosID >= 0, // prepend BOS if available
 	}, nil
 }
 
@@ -255,7 +255,8 @@ func (t *HFTokenizer) Decode(ids []int32) (string, error) {
 	return result, nil
 }
 
-func (t *HFTokenizer) VocabSize() int   { return t.vocabSize }
+func (t *HFTokenizer) VocabSize() int    { return t.vocabSize }
+func (t *HFTokenizer) BOSTokenID() int32 { return t.bosID }
 func (t *HFTokenizer) EOSTokenID() int32 { return t.eosID }
 
 // SpecialTokenIDs returns a sorted list of special token IDs for filtering.

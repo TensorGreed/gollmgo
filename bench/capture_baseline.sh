@@ -70,7 +70,11 @@ done
 # Run the serving benchmark. tee to stdout so the user sees progress.
 TMPDIR="$(mktemp -d)"
 RAW="$TMPDIR/raw.json"
-"$BINARY" bench --mode serving --config "$CONFIG" --url "$URL" > "$RAW"
+BENCH_ARGS=(bench --mode serving --config "$CONFIG" --url "$URL")
+if [ -n "${GOLLMGO_BENCH_MODEL_PATH:-}" ]; then
+    BENCH_ARGS+=(--model "$GOLLMGO_BENCH_MODEL_PATH")
+fi
+"$BINARY" "${BENCH_ARGS[@]}" > "$RAW"
 
 # Install as the frozen baseline, stripping placeholder markers so the
 # regression gate will actually run against it.

@@ -57,7 +57,8 @@ func (t *ByteLevelTokenizer) Decode(ids []int32) (string, error) {
 	return sb.String(), nil
 }
 
-func (t *ByteLevelTokenizer) VocabSize() int   { return t.vocabSize }
+func (t *ByteLevelTokenizer) VocabSize() int    { return t.vocabSize }
+func (t *ByteLevelTokenizer) BOSTokenID() int32 { return -1 }
 func (t *ByteLevelTokenizer) EOSTokenID() int32 { return t.eosID }
 
 // Compile-time check.

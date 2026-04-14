@@ -2,7 +2,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"flag"
@@ -15,7 +14,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -213,22 +211,31 @@ func cmdServe(args []string) {
 // benchConfig holds frozen benchmark parameters loaded from --config.
 type benchConfig struct {
 	Benchmark struct {
-		Mode        string `json:"mode"`
-		NumPrompts  int    `json:"num_prompts"`
-		PromptLen   int    `json:"prompt_len"`
-		OutputLen   int    `json:"output_len"`
-		Concurrency int    `json:"concurrency"`
+		Mode           string  `json:"mode"`
+		NumPrompts     int     `json:"num_prompts"`
+		PromptLen      int     `json:"prompt_len"`
+		OutputLen      int     `json:"output_len"`
+		Concurrency    int     `json:"concurrency"`
+		QPS            float64 `json:"qps"`
+		Duration       string  `json:"duration"`
+		WarmupRequests int     `json:"warmup_requests"`
+		Repetitions    int     `json:"repetitions"`
 	} `json:"benchmark"`
 }
 
 func cmdBench(args []string) {
 	fs := flag.NewFlagSet("bench", flag.ExitOnError)
-	mode := fs.String("mode", "offline", "benchmark mode: offline, serving")
+	mode := fs.String("mode", "synthetic", "benchmark mode: synthetic, serving")
 	numPrompts := fs.Int("num-prompts", 100, "number of prompts to run")
 	promptLen := fs.Int("prompt-len", 128, "prompt length in tokens")
 	outputLen := fs.Int("output-len", 128, "max output tokens per request")
 	concurrency := fs.Int("concurrency", 1, "concurrent requests (serving mode)")
+	qps := fs.Float64("qps", 0, "Poisson arrival rate in requests/sec (serving mode)")
+	durationStr := fs.String("duration", "", "optional wall-clock limit for Poisson serving mode (for example: 30s)")
+	warmupRequests := fs.Int("warmup-requests", 0, "warmup requests excluded from measurements")
+	repetitions := fs.Int("repetitions", 1, "number of measured repetitions")
 	targetURL := fs.String("url", "", "target server URL (serving mode)")
+	modelSpec := fs.String("model", "", "local model path or HF repo id for exact prompt sizing/token accounting")
 	configFile := fs.String("config", "", "path to frozen benchmark config JSON (overrides flags)")
 	fs.Parse(args)
 
@@ -261,18 +268,64 @@ func cmdBench(args []string) {
 		if bc.Benchmark.Concurrency > 0 {
 			*concurrency = bc.Benchmark.Concurrency
 		}
+		if bc.Benchmark.QPS > 0 {
+			*qps = bc.Benchmark.QPS
+		}
+		if bc.Benchmark.Duration != "" {
+			*durationStr = bc.Benchmark.Duration
+		}
+		if bc.Benchmark.WarmupRequests > 0 {
+			*warmupRequests = bc.Benchmark.WarmupRequests
+		}
+		if bc.Benchmark.Repetitions > 0 {
+			*repetitions = bc.Benchmark.Repetitions
+		}
 		log.Info("loaded benchmark config", "path", *configFile)
 	}
 
+	duration := time.Duration(0)
+	if strings.TrimSpace(*durationStr) != "" {
+		parsed, err := time.ParseDuration(*durationStr)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error parsing duration: %v\n", err)
+			os.Exit(1)
+		}
+		duration = parsed
+	}
+
+	opts := benchOptions{
+		Mode:           *mode,
+		NumPrompts:     *numPrompts,
+		PromptLen:      *promptLen,
+		OutputLen:      *outputLen,
+		Concurrency:    *concurrency,
+		QPS:            *qps,
+		Duration:       duration,
+		WarmupRequests: *warmupRequests,
+		Repetitions:    *repetitions,
+		ModelSpec:      *modelSpec,
+		TargetURL:      *targetURL,
+	}
+
 	switch *mode {
-	case "offline":
+	case "offline", "synthetic":
 		runOfflineBench(log, *numPrompts, *promptLen, *outputLen)
 	case "serving":
 		if *targetURL == "" {
 			fmt.Fprintln(os.Stderr, "error: --url required for serving mode")
 			os.Exit(1)
 		}
-		runServingBench(log, *targetURL, *numPrompts, *promptLen, *outputLen, *concurrency)
+		tok, promptMode, err := resolveBenchTokenizer(log, *modelSpec)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "benchmark tokenizer init failed: %v\n", err)
+			os.Exit(1)
+		}
+		if strings.TrimSpace(*modelSpec) == "" {
+			log.Warn("serving benchmark running without --model; prompt sizing and token accounting are approximate")
+		} else if tok == nil {
+			log.Warn("benchmark tokenizer unavailable; prompt sizing and token accounting fell back", "model", *modelSpec)
+		}
+		runServingBench(log, opts, tok, promptMode)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown bench mode: %s\n", *mode)
 		os.Exit(1)
@@ -280,7 +333,7 @@ func cmdBench(args []string) {
 }
 
 func runOfflineBench(log *slog.Logger, numPrompts, promptLen, outputLen int) {
-	log.Info("offline benchmark",
+	log.Info("synthetic benchmark",
 		"num_prompts", numPrompts,
 		"prompt_len", promptLen,
 		"output_len", outputLen)
@@ -355,7 +408,7 @@ func runOfflineBench(log *slog.Logger, numPrompts, promptLen, outputLen int) {
 		Timestamp:       time.Now().UTC().Format(time.RFC3339),
 		GitSHA:          getGitSHA(),
 		Hardware:        "DGX Spark GB10",
-		Mode:            "offline",
+		Mode:            "synthetic",
 		NumPrompts:      completed,
 		PromptLen:       promptLen,
 		OutputLen:       outputLen,
@@ -368,183 +421,61 @@ func runOfflineBench(log *slog.Logger, numPrompts, promptLen, outputLen int) {
 	saveBenchResult(result, data)
 }
 
-func runServingBench(log *slog.Logger, targetURL string, numPrompts, promptLen, outputLen, concurrency int) {
+func runServingBench(log *slog.Logger, opts benchOptions, tok model.Tokenizer, promptMode string) {
 	log.Info("serving benchmark",
-		"url", targetURL,
-		"num_prompts", numPrompts,
-		"prompt_len", promptLen,
-		"output_len", outputLen,
-		"concurrency", concurrency)
+		"url", opts.TargetURL,
+		"num_prompts", opts.NumPrompts,
+		"prompt_len", opts.PromptLen,
+		"output_len", opts.OutputLen,
+		"concurrency", opts.Concurrency,
+		"qps", opts.QPS,
+		"duration", opts.Duration,
+		"warmup_requests", opts.WarmupRequests,
+		"repetitions", opts.Repetitions)
 
-	type requestResult struct {
-		ttft   time.Duration   // time to first content token (from streaming SSE)
-		e2e    time.Duration   // total request duration
-		itls   []time.Duration // inter-token latencies
-		tokens int
-		err    bool
-	}
-
-	results := make(chan requestResult, numPrompts)
-	sem := make(chan struct{}, concurrency)
-	client := &http.Client{Timeout: 120 * time.Second}
-
-	start := time.Now()
-
-	for i := 0; i < numPrompts; i++ {
-		sem <- struct{}{}
-		go func(idx int) {
-			defer func() { <-sem }()
-
-			prompt := fmt.Sprintf("Prompt number %d. Please continue writing about topic %d.", idx, idx%10)
-
-			payload := map[string]any{
-				"model":      "gollmgo-default",
-				"max_tokens": outputLen,
-				"stream":     true,
-				"messages": []map[string]string{
-					{"role": "user", "content": prompt},
-				},
-			}
-			body, _ := json.Marshal(payload)
-
-			reqStart := time.Now()
-			resp, err := client.Post(targetURL+"/v1/chat/completions", "application/json",
-				io.NopCloser(io.NewSectionReader(newBytesReader(body), 0, int64(len(body)))))
-			if err != nil {
-				log.Error("request failed", "error", err)
-				results <- requestResult{err: true}
-				return
-			}
-			defer resp.Body.Close()
-
-			// Parse SSE stream to measure real TTFT and per-token ITL.
-			var ttft time.Duration
-			var itls []time.Duration
-			tokens := 0
-			lastTokenTime := reqStart
-			firstContent := true
-
-			scanner := bufio.NewScanner(resp.Body)
-			for scanner.Scan() {
-				line := scanner.Text()
-				if !strings.HasPrefix(line, "data: ") {
-					continue
-				}
-				data := strings.TrimPrefix(line, "data: ")
-				if data == "[DONE]" {
-					break
-				}
-
-				// Check if this chunk has content (skip role-only chunks).
-				if !strings.Contains(data, `"content"`) {
-					continue
-				}
-
-				now := time.Now()
-				tokens++
-				if firstContent {
-					ttft = now.Sub(reqStart)
-					firstContent = false
-				} else {
-					itls = append(itls, now.Sub(lastTokenTime))
-				}
-				lastTokenTime = now
-			}
-			e2e := time.Since(reqStart)
-			results <- requestResult{ttft: ttft, e2e: e2e, itls: itls, tokens: tokens}
-		}(i)
-	}
-
-	// Wait for all goroutines.
-	for i := 0; i < concurrency; i++ {
-		sem <- struct{}{}
-	}
-	close(results)
-
-	elapsed := time.Since(start)
-
-	// Collect and compute stats.
-	var ttfts, e2es, allITLs []float64
-	totalTokens := 0
-	errorCount := 0
-	for r := range results {
-		if r.err {
-			errorCount++
-			continue
-		}
-		ttfts = append(ttfts, float64(r.ttft.Microseconds())/1000.0)
-		e2es = append(e2es, float64(r.e2e.Microseconds())/1000.0)
-		totalTokens += r.tokens
-		for _, itl := range r.itls {
-			allITLs = append(allITLs, float64(itl.Microseconds())/1000.0)
-		}
-	}
-
-	count := len(ttfts)
-	if count == 0 {
-		fmt.Fprintln(os.Stderr, "no successful requests")
+	result, err := runServingBenchSuite(log, opts, tok, promptMode)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
 		return
 	}
 
-	sort.Float64s(ttfts)
-	sort.Float64s(e2es)
-	sort.Float64s(allITLs)
-
-	gitSHA := getGitSHA()
-
-	result := BenchResult{
-		Timestamp:       time.Now().UTC().Format(time.RFC3339),
-		GitSHA:          gitSHA,
-		Hardware:        "DGX Spark GB10",
-		Mode:            "serving",
-		NumPrompts:      numPrompts,
-		PromptLen:       promptLen,
-		OutputLen:       outputLen,
-		Concurrency:     concurrency,
-		ElapsedSeconds:  elapsed.Seconds(),
-		TokensPerSecond: float64(totalTokens) / elapsed.Seconds(),
-		RequestsPerSec:  float64(count) / elapsed.Seconds(),
-		ErrorCount:      errorCount,
-		TTFTP50Ms:       percentile(ttfts, 0.50),
-		TTFTP95Ms:       percentile(ttfts, 0.95),
-		TTFTP99Ms:       percentile(ttfts, 0.99),
-		E2EP50Ms:        percentile(e2es, 0.50),
-		E2EP95Ms:        percentile(e2es, 0.95),
-		E2EP99Ms:        percentile(e2es, 0.99),
-		ITLP50Ms:        percentile(allITLs, 0.50),
-		ITLP95Ms:        percentile(allITLs, 0.95),
-		ITLP99Ms:        percentile(allITLs, 0.99),
-	}
 	data, _ := json.MarshalIndent(result, "", "  ")
 	fmt.Println(string(data))
-
-	// Save to bench/results/.
 	saveBenchResult(result, data)
 }
 
 // BenchResult holds benchmark output per docs/benchmarks.md.
 type BenchResult struct {
-	Timestamp       string  `json:"timestamp"`
-	GitSHA          string  `json:"git_sha"`
-	Hardware        string  `json:"hardware"`
-	Mode            string  `json:"mode"`
-	NumPrompts      int     `json:"num_prompts"`
-	PromptLen       int     `json:"prompt_len"`
-	OutputLen       int     `json:"output_len"`
-	Concurrency     int     `json:"concurrency,omitempty"`
-	ElapsedSeconds  float64 `json:"elapsed_seconds"`
-	TokensPerSecond float64 `json:"tokens_per_second"`
-	RequestsPerSec  float64 `json:"requests_per_second"`
-	ErrorCount      int     `json:"error_count"`
-	TTFTP50Ms       float64 `json:"ttft_p50_ms"`
-	TTFTP95Ms       float64 `json:"ttft_p95_ms"`
-	TTFTP99Ms       float64 `json:"ttft_p99_ms"`
-	E2EP50Ms        float64 `json:"e2e_p50_ms"`
-	E2EP95Ms        float64 `json:"e2e_p95_ms"`
-	E2EP99Ms        float64 `json:"e2e_p99_ms"`
-	ITLP50Ms        float64 `json:"itl_p50_ms"`
-	ITLP95Ms        float64 `json:"itl_p95_ms"`
-	ITLP99Ms        float64 `json:"itl_p99_ms"`
+	Timestamp        string        `json:"timestamp"`
+	GitSHA           string        `json:"git_sha"`
+	Hardware         string        `json:"hardware"`
+	Mode             string        `json:"mode"`
+	NumPrompts       int           `json:"num_prompts"`
+	MeasuredRequests int           `json:"measured_requests,omitempty"`
+	PromptLen        int           `json:"prompt_len"`
+	OutputLen        int           `json:"output_len"`
+	Concurrency      int           `json:"concurrency,omitempty"`
+	WarmupRequests   int           `json:"warmup_requests,omitempty"`
+	Repetitions      int           `json:"repetitions,omitempty"`
+	ArrivalMode      string        `json:"arrival_mode,omitempty"`
+	PromptGeneration string        `json:"prompt_generation,omitempty"`
+	TokenCountMode   string        `json:"token_count_mode,omitempty"`
+	QPS              float64       `json:"qps,omitempty"`
+	DurationSeconds  float64       `json:"duration_seconds,omitempty"`
+	ElapsedSeconds   float64       `json:"elapsed_seconds"`
+	TokensPerSecond  float64       `json:"tokens_per_second"`
+	RequestsPerSec   float64       `json:"requests_per_second"`
+	ErrorCount       int           `json:"error_count"`
+	TTFTP50Ms        float64       `json:"ttft_p50_ms"`
+	TTFTP95Ms        float64       `json:"ttft_p95_ms"`
+	TTFTP99Ms        float64       `json:"ttft_p99_ms"`
+	E2EP50Ms         float64       `json:"e2e_p50_ms"`
+	E2EP95Ms         float64       `json:"e2e_p95_ms"`
+	E2EP99Ms         float64       `json:"e2e_p99_ms"`
+	ITLP50Ms         float64       `json:"itl_p50_ms"`
+	ITLP95Ms         float64       `json:"itl_p95_ms"`
+	ITLP99Ms         float64       `json:"itl_p99_ms"`
+	Samples          []benchSample `json:"samples,omitempty"`
 }
 
 func percentile(sorted []float64, p float64) float64 {

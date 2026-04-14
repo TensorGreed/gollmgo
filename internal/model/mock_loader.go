@@ -38,5 +38,6 @@ func (t *MockTokenizer) Decode(ids []int32) (string, error) {
 	return string(bs), nil
 }
 
-func (t *MockTokenizer) VocabSize() int  { return t.Vocab }
+func (t *MockTokenizer) VocabSize() int    { return t.Vocab }
+func (t *MockTokenizer) BOSTokenID() int32 { return -1 }
 func (t *MockTokenizer) EOSTokenID() int32 { return t.EOS }

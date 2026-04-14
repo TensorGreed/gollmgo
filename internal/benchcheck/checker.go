@@ -69,20 +69,21 @@ type MetricThreshold struct {
 // metrics at the top level (not nested under "metrics"). Unknown fields are
 // ignored so this stays forward-compatible with new metrics.
 type BaselineResult struct {
-	Placeholder     bool    `json:"placeholder"`
-	NumPrompts      int     `json:"num_prompts"`
-	ErrorCount      int     `json:"error_count"`
-	TokensPerSecond float64 `json:"tokens_per_second"`
-	RequestsPerSec  float64 `json:"requests_per_second"`
-	TTFTP50Ms       float64 `json:"ttft_p50_ms"`
-	TTFTP95Ms       float64 `json:"ttft_p95_ms"`
-	TTFTP99Ms       float64 `json:"ttft_p99_ms"`
-	ITLP50Ms        float64 `json:"itl_p50_ms"`
-	ITLP95Ms        float64 `json:"itl_p95_ms"`
-	ITLP99Ms        float64 `json:"itl_p99_ms"`
-	E2EP50Ms        float64 `json:"e2e_p50_ms"`
-	E2EP95Ms        float64 `json:"e2e_p95_ms"`
-	E2EP99Ms        float64 `json:"e2e_p99_ms"`
+	Placeholder      bool    `json:"placeholder"`
+	NumPrompts       int     `json:"num_prompts"`
+	MeasuredRequests int     `json:"measured_requests"`
+	ErrorCount       int     `json:"error_count"`
+	TokensPerSecond  float64 `json:"tokens_per_second"`
+	RequestsPerSec   float64 `json:"requests_per_second"`
+	TTFTP50Ms        float64 `json:"ttft_p50_ms"`
+	TTFTP95Ms        float64 `json:"ttft_p95_ms"`
+	TTFTP99Ms        float64 `json:"ttft_p99_ms"`
+	ITLP50Ms         float64 `json:"itl_p50_ms"`
+	ITLP95Ms         float64 `json:"itl_p95_ms"`
+	ITLP99Ms         float64 `json:"itl_p99_ms"`
+	E2EP50Ms         float64 `json:"e2e_p50_ms"`
+	E2EP95Ms         float64 `json:"e2e_p95_ms"`
+	E2EP99Ms         float64 `json:"e2e_p99_ms"`
 }
 
 // metricsMap returns a name→value view of a result, including derived metrics
@@ -102,8 +103,12 @@ func (r BaselineResult) metricsMap() map[string]float64 {
 		"e2e_p99_ms":          r.E2EP99Ms,
 		"error_count":         float64(r.ErrorCount),
 	}
-	if r.NumPrompts > 0 {
-		m["error_rate_pct"] = float64(r.ErrorCount) / float64(r.NumPrompts) * 100.0
+	denom := r.MeasuredRequests
+	if denom <= 0 {
+		denom = r.NumPrompts
+	}
+	if denom > 0 {
+		m["error_rate_pct"] = float64(r.ErrorCount) / float64(denom) * 100.0
 	} else {
 		m["error_rate_pct"] = 0
 	}

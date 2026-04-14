@@ -30,5 +30,6 @@ type Tokenizer interface {
 	Encode(text string) ([]int32, error)
 	Decode(ids []int32) (string, error)
 	VocabSize() int
+	BOSTokenID() int32
 	EOSTokenID() int32
 }

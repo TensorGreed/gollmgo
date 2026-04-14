@@ -23,5 +23,5 @@
   "sampling": {
     "temperature": 0
   },
-  "notes": "Run with: gollmgo bench --mode serving --config bench/baseline_config.json --url http://localhost:8080"
+  "notes": "Run with: gollmgo bench --mode serving --config bench/baseline_config.json --url http://localhost:8080 --model /path/to/model"
 }

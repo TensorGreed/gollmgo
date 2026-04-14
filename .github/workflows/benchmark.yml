@@ -69,6 +69,7 @@ jobs:
         run: |
           bin/gollmgo bench --mode serving \
             --config bench/baseline_config.json \
+            --model "$GOLLMGO_BENCH_MODEL_PATH" \
             --url http://localhost:8080 \
             > bench/results/current.json
       - name: Check regression vs baseline
@@ -84,6 +85,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: gpu-benchmark-results
+          if-no-files-found: ignore
           path: |
             bench/results/current.json
             bench/results/server.log
+            bench/results/vllm_*.json
+            bench/PARITY_SUMMARY.md
