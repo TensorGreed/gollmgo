@@ -96,27 +96,7 @@ func (l *GGUFLoader) Load(_ context.Context, path string) (*ModelMeta, error) {
 	}
 
 	// Extract known keys.
-	if v, ok := kv["general.architecture"].(string); ok {
-		meta.Family = v
-	}
-	if v, ok := kv["general.name"].(string); ok {
-		meta.Name = v
-	}
-	if v, ok := getUint32(kv, meta.Family+".block_count"); ok {
-		meta.NumLayers = int(v)
-	}
-	if v, ok := getUint32(kv, meta.Family+".embedding_length"); ok {
-		meta.HiddenSize = int(v)
-	}
-	if v, ok := getUint32(kv, meta.Family+".attention.head_count"); ok {
-		meta.NumHeads = int(v)
-	}
-	if v, ok := getUint32(kv, meta.Family+".attention.head_count_kv"); ok {
-		meta.NumKVHeads = int(v)
-	}
-	if v, ok := getUint32(kv, meta.Family+".context_length"); ok {
-		meta.MaxSeqLen = int(v)
-	}
+	populateMetaFromGGUFKV(meta, kv)
 
 	_ = tensorCount // used by LoadGGUFWeights
 
@@ -228,30 +208,7 @@ func LoadGGUFWeights(path string) ([]WeightTensor, *ModelMeta, error) {
 
 	// Build metadata.
 	meta := &ModelMeta{}
-	if v, ok := kv["general.architecture"].(string); ok {
-		meta.Family = v
-	}
-	if v, ok := kv["general.name"].(string); ok {
-		meta.Name = v
-	}
-	if v, ok := getUint32(kv, meta.Family+".block_count"); ok {
-		meta.NumLayers = int(v)
-	}
-	if v, ok := getUint32(kv, meta.Family+".embedding_length"); ok {
-		meta.HiddenSize = int(v)
-	}
-	if v, ok := getUint32(kv, meta.Family+".attention.head_count"); ok {
-		meta.NumHeads = int(v)
-	}
-	if v, ok := getUint32(kv, meta.Family+".attention.head_count_kv"); ok {
-		meta.NumKVHeads = int(v)
-	}
-	if v, ok := getUint32(kv, meta.Family+".context_length"); ok {
-		meta.MaxSeqLen = int(v)
-	}
-	if v, ok := getUint32(kv, meta.Family+".vocab_size"); ok {
-		meta.VocabSize = int(v)
-	}
+	populateMetaFromGGUFKV(meta, kv)
 
 	// Parse tensor descriptors.
 	descs := make([]ggufTensorDesc, tensorCount)
@@ -329,7 +286,7 @@ func LoadGGUFWeights(path string) ([]WeightTensor, *ModelMeta, error) {
 		}
 
 		tensors = append(tensors, WeightTensor{
-			Name:  desc.Name,
+			Name:  normalizeGGUFTensorName(desc.Name),
 			Dtype: dtypeName,
 			Shape: intShape,
 			Data:  data,
@@ -337,6 +294,83 @@ func LoadGGUFWeights(path string) ([]WeightTensor, *ModelMeta, error) {
 	}
 
 	return tensors, meta, nil
+}
+
+func populateMetaFromGGUFKV(meta *ModelMeta, kv map[string]any) {
+	if v, ok := kv["general.architecture"].(string); ok {
+		meta.Family = v
+	}
+	if v, ok := kv["general.name"].(string); ok {
+		meta.Name = v
+	}
+	if v, ok := getUint32(kv, meta.Family+".block_count"); ok {
+		meta.NumLayers = int(v)
+	}
+	if v, ok := getUint32(kv, meta.Family+".embedding_length"); ok {
+		meta.HiddenSize = int(v)
+	}
+	if v, ok := getUint32(kv, meta.Family+".feed_forward_length"); ok {
+		meta.IntermediateSize = int(v)
+	}
+	if v, ok := getUint32(kv, meta.Family+".attention.head_count"); ok {
+		meta.NumHeads = int(v)
+	}
+	if v, ok := getUint32(kv, meta.Family+".attention.head_count_kv"); ok {
+		meta.NumKVHeads = int(v)
+	}
+	if v, ok := getUint32(kv, meta.Family+".context_length"); ok {
+		meta.MaxSeqLen = int(v)
+	}
+	if v, ok := getUint32(kv, meta.Family+".vocab_size"); ok {
+		meta.VocabSize = int(v)
+	}
+	if v, ok := getUint32(kv, "tokenizer.ggml.bos_token_id"); ok {
+		meta.BOSTokenID = int32(v)
+	}
+	if v, ok := getUint32(kv, "tokenizer.ggml.eos_token_id"); ok {
+		meta.EOSTokenID = int32(v)
+	}
+	if meta.NumKVHeads == 0 {
+		meta.NumKVHeads = meta.NumHeads
+	}
+}
+
+func normalizeGGUFTensorName(name string) string {
+	switch name {
+	case "token_embd.weight":
+		return "model.embed_tokens.weight"
+	case "output_norm.weight":
+		return "model.norm.weight"
+	case "output.weight":
+		return "lm_head.weight"
+	}
+
+	var layer int
+	var suffix string
+	if n, _ := fmt.Sscanf(name, "blk.%d.%s", &layer, &suffix); n == 2 {
+		switch suffix {
+		case "attn_norm.weight":
+			return fmt.Sprintf("model.layers.%d.input_layernorm.weight", layer)
+		case "attn_q.weight":
+			return fmt.Sprintf("model.layers.%d.self_attn.q_proj.weight", layer)
+		case "attn_k.weight":
+			return fmt.Sprintf("model.layers.%d.self_attn.k_proj.weight", layer)
+		case "attn_v.weight":
+			return fmt.Sprintf("model.layers.%d.self_attn.v_proj.weight", layer)
+		case "attn_output.weight":
+			return fmt.Sprintf("model.layers.%d.self_attn.o_proj.weight", layer)
+		case "ffn_norm.weight":
+			return fmt.Sprintf("model.layers.%d.post_attention_layernorm.weight", layer)
+		case "ffn_gate.weight":
+			return fmt.Sprintf("model.layers.%d.mlp.gate_proj.weight", layer)
+		case "ffn_up.weight":
+			return fmt.Sprintf("model.layers.%d.mlp.up_proj.weight", layer)
+		case "ffn_down.weight":
+			return fmt.Sprintf("model.layers.%d.mlp.down_proj.weight", layer)
+		}
+	}
+
+	return name
 }
 
 func readGGUFString(r io.Reader) (string, error) {

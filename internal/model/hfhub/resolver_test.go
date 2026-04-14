@@ -49,7 +49,7 @@ func (m *mockHFServer) handle(w http.ResponseWriter, r *http.Request) {
 	m.mu.Unlock()
 	// Tree API.
 	treePrefix := fmt.Sprintf("/api/models/%s/tree/%s", m.repo, m.revision)
-	if strings.HasPrefix(r.URL.Path, treePrefix) {
+	if strings.HasPrefix(r.URL.EscapedPath(), treePrefix) {
 		var entries []treeEntry
 		for path, body := range m.files {
 			entries = append(entries, treeEntry{
@@ -62,8 +62,8 @@ func (m *mockHFServer) handle(w http.ResponseWriter, r *http.Request) {
 	}
 	// Resolve/download API.
 	resolvePrefix := fmt.Sprintf("/%s/resolve/%s/", m.repo, m.revision)
-	if strings.HasPrefix(r.URL.Path, resolvePrefix) {
-		path := strings.TrimPrefix(r.URL.Path, resolvePrefix)
+	if strings.HasPrefix(r.URL.EscapedPath(), resolvePrefix) {
+		path := strings.TrimPrefix(r.URL.EscapedPath(), resolvePrefix)
 		body, ok := m.files[path]
 		if !ok {
 			http.Error(w, "not found", http.StatusNotFound)
@@ -89,10 +89,10 @@ func TestResolverDownloadsHFRepo(t *testing.T) {
 	repo := "fake-org/fake-model"
 	rev := "main"
 	files := map[string][]byte{
-		"config.json":            []byte(`{"hidden_size":128}`),
-		"tokenizer.json":         []byte(`{"model":{"type":"BPE"}}`),
-		"model.safetensors":      make([]byte, 4096),
-		"ignored.bin":            []byte("pytorch weights — should be skipped"),
+		"config.json":             []byte(`{"hidden_size":128}`),
+		"tokenizer.json":          []byte(`{"model":{"type":"BPE"}}`),
+		"model.safetensors":       make([]byte, 4096),
+		"ignored.bin":             []byte("pytorch weights — should be skipped"),
 		"special_tokens_map.json": []byte(`{}`),
 	}
 	srv := newMockHFServer(t, repo, rev, files)
@@ -133,12 +133,12 @@ func TestResolverDownloadsHFRepo(t *testing.T) {
 func TestResolverShardedModel(t *testing.T) {
 	repo := "fake/sharded"
 	files := map[string][]byte{
-		"config.json":                       []byte(`{}`),
-		"tokenizer.json":                    []byte(`{}`),
-		"model-00001-of-00003.safetensors":  make([]byte, 1024),
-		"model-00002-of-00003.safetensors":  make([]byte, 1024),
-		"model-00003-of-00003.safetensors":  make([]byte, 1024),
-		"model.safetensors.index.json":      []byte(`{"weight_map":{}}`),
+		"config.json":                      []byte(`{}`),
+		"tokenizer.json":                   []byte(`{}`),
+		"model-00001-of-00003.safetensors": make([]byte, 1024),
+		"model-00002-of-00003.safetensors": make([]byte, 1024),
+		"model-00003-of-00003.safetensors": make([]byte, 1024),
+		"model.safetensors.index.json":     []byte(`{"weight_map":{}}`),
 	}
 	srv := newMockHFServer(t, repo, "main", files)
 	defer srv.Close()
@@ -309,5 +309,41 @@ func TestResolverLocalPath(t *testing.T) {
 	}
 	if h.ConfigPath == "" || h.TokenizerPath == "" {
 		t.Error("expected config and tokenizer paths")
+	}
+}
+
+func TestResolverLocalGGUFFile(t *testing.T) {
+	tmp := t.TempDir()
+	ggufPath := filepath.Join(tmp, "model.gguf")
+	os.WriteFile(ggufPath, make([]byte, 128), 0o644)
+
+	r := &Resolver{
+		HTTPClient: &http.Client{Timeout: time.Second},
+		Log:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	h, err := r.Resolve(context.Background(), Spec{IsLocal: true, LocalPath: ggufPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(h.WeightsFiles) != 1 || h.WeightsFiles[0] != ggufPath {
+		t.Fatalf("expected GGUF weight file %q, got %v", ggufPath, h.WeightsFiles)
+	}
+}
+
+func TestResolverLocalGGUFDirectory(t *testing.T) {
+	tmp := t.TempDir()
+	ggufPath := filepath.Join(tmp, "model.gguf")
+	os.WriteFile(ggufPath, make([]byte, 128), 0o644)
+
+	r := &Resolver{
+		HTTPClient: &http.Client{Timeout: time.Second},
+		Log:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	h, err := r.Resolve(context.Background(), Spec{IsLocal: true, LocalPath: tmp})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(h.WeightsFiles) != 1 || h.WeightsFiles[0] != ggufPath {
+		t.Fatalf("expected GGUF weight file %q, got %v", ggufPath, h.WeightsFiles)
 	}
 }

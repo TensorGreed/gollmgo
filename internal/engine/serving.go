@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 // the drafter is disabled for the rest of the process lifetime.
 type SpeculativeSettings struct {
 	Enabled        bool
+	Mode           string
 	NGramSize      int     // window used by the n-gram drafter (default 3)
 	NumDraftTokens int     // max drafts per step (K, default 4)
 	KillThreshold  float64 // disable if acceptance rate < threshold (0 = never kill)
@@ -43,10 +45,10 @@ type ServingEngine struct {
 
 	// Speculative decoding (M6). drafter is nil when disabled or when the
 	// backend doesn't support it. kvSwapper is the optional KV-swap capability.
-	specCfg     SpeculativeSettings
-	drafter     *NGramDrafter
-	kvSwapper   backend.KVSwapper // non-nil if runner implements KVSwapper
-	swapStore   map[uint64]backend.KVSnapshot // seqID -> snapshot while preempted
+	specCfg   SpeculativeSettings
+	drafter   *NGramDrafter
+	kvSwapper backend.KVSwapper             // non-nil if runner implements KVSwapper
+	swapStore map[uint64]backend.KVSnapshot // seqID -> snapshot while preempted
 
 	mu          sync.Mutex
 	blockTables map[uint64]*kvcache.BlockTable // seqID -> block table
@@ -111,7 +113,15 @@ func NewServingEngine(cfg ServingEngineConfig) *ServingEngine {
 	}
 	caps := cfg.Runner.Capabilities()
 	if cfg.Speculative.Enabled {
-		if !caps.SpeculativeDecoding {
+		mode := strings.ToLower(strings.TrimSpace(cfg.Speculative.Mode))
+		if mode == "" {
+			mode = "ngram"
+		}
+		if mode != "ngram" {
+			e.log.Warn("unsupported speculative mode requested; disabling",
+				"mode", mode)
+			e.specCfg.Enabled = false
+		} else if !caps.SpeculativeDecoding {
 			e.log.Warn("speculative decoding requested but runner doesn't advertise it; disabling",
 				"runner", fmt.Sprintf("%T", cfg.Runner))
 			e.specCfg.Enabled = false
@@ -129,6 +139,7 @@ func NewServingEngine(cfg ServingEngineConfig) *ServingEngine {
 				e.specCfg.KillWarmup = 128
 			}
 			e.log.Info("speculative decoding enabled",
+				"mode", mode,
 				"n_gram_size", n, "max_drafts", k,
 				"kill_threshold", cfg.Speculative.KillThreshold)
 		}

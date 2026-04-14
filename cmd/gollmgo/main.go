@@ -165,6 +165,7 @@ func cmdServe(args []string) {
 		MaxPrefixBlocks:   cfg.PrefixCacheMaxBlocks,
 		Speculative: engine.SpeculativeSettings{
 			Enabled:        cfg.Speculative.Enabled,
+			Mode:           cfg.Speculative.Mode,
 			NGramSize:      cfg.Speculative.NGramSize,
 			NumDraftTokens: cfg.Speculative.NumDraftTokens,
 			KillThreshold:  cfg.Speculative.KillThreshold,

@@ -114,17 +114,18 @@ func (r *Resolver) Resolve(ctx context.Context, spec Spec) (*Handle, error) {
 }
 
 // handleFromDir builds a Handle from an existing local directory or file.
-// Accepts either a directory (HF layout) or a single .safetensors file.
+// Accepts either a directory (HF layout) or a single .safetensors/.gguf file.
 func handleFromDir(path string) (*Handle, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, fmt.Errorf("hfhub: stat %s: %w", path, err)
 	}
-	// Single safetensors file → treat its directory as the model dir.
+	// Single supported weight file → treat its directory as the model dir.
 	if !info.IsDir() {
 		dir := filepath.Dir(path)
-		if !strings.HasSuffix(strings.ToLower(path), ".safetensors") {
-			return nil, fmt.Errorf("hfhub: %s is not a directory or .safetensors file", path)
+		low := strings.ToLower(path)
+		if !strings.HasSuffix(low, ".safetensors") && !strings.HasSuffix(low, ".gguf") {
+			return nil, fmt.Errorf("hfhub: %s is not a directory or .safetensors/.gguf file", path)
 		}
 		h := &Handle{LocalDir: dir, WeightsFiles: []string{path}}
 		h.ConfigPath = ifExists(filepath.Join(dir, "config.json"))
@@ -140,18 +141,31 @@ func handleFromDir(path string) (*Handle, error) {
 	if err != nil {
 		return nil, fmt.Errorf("hfhub: readdir %s: %w", path, err)
 	}
+	var safetensorsFiles []string
+	var ggufFiles []string
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
 		}
-		if strings.HasSuffix(e.Name(), ".safetensors") {
-			h.WeightsFiles = append(h.WeightsFiles, filepath.Join(path, e.Name()))
+		low := strings.ToLower(e.Name())
+		switch {
+		case strings.HasSuffix(low, ".safetensors"):
+			safetensorsFiles = append(safetensorsFiles, filepath.Join(path, e.Name()))
+		case strings.HasSuffix(low, ".gguf"):
+			ggufFiles = append(ggufFiles, filepath.Join(path, e.Name()))
 		}
 	}
-	if len(h.WeightsFiles) == 0 {
-		return nil, fmt.Errorf("hfhub: no .safetensors files in %s", path)
+	switch {
+	case len(safetensorsFiles) > 0:
+		h.WeightsFiles = safetensorsFiles
+		h.IsSharded = len(h.WeightsFiles) > 1
+	case len(ggufFiles) == 1:
+		h.WeightsFiles = ggufFiles
+	case len(ggufFiles) > 1:
+		return nil, fmt.Errorf("hfhub: multiple .gguf files in %s; pick one explicitly", path)
+	default:
+		return nil, fmt.Errorf("hfhub: no .safetensors/.gguf files in %s", path)
 	}
-	h.IsSharded = len(h.WeightsFiles) > 1
 	return h, nil
 }
 
@@ -236,9 +250,9 @@ func (r *Resolver) listFiles(ctx context.Context, repo, revision string) ([]tree
 	var walk func(subpath string) error
 	walk = func(subpath string) error {
 		u := fmt.Sprintf("%s/api/models/%s/tree/%s", Endpoint,
-			url.PathEscape(repo), url.PathEscape(revision))
+			escapePath(repo), url.PathEscape(revision))
 		if subpath != "" {
-			u += "/" + url.PathEscape(subpath)
+			u += "/" + escapePath(subpath)
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 		if err != nil {
@@ -327,7 +341,7 @@ func (r *Resolver) downloadOne(ctx context.Context, repo, revision string, f tre
 	}
 
 	u := fmt.Sprintf("%s/%s/resolve/%s/%s", Endpoint,
-		url.PathEscape(repo), url.PathEscape(revision),
+		escapePath(repo), url.PathEscape(revision),
 		// Use url.PathEscape per path segment so nested paths survive.
 		escapePath(f.Path))
 

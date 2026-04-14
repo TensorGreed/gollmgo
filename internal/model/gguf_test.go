@@ -49,13 +49,16 @@ func writeGGUFTestString(buf *bytes.Buffer, s string) {
 
 func TestGGUFLoaderParsesMetadata(t *testing.T) {
 	path := writeGGUFv3File(t, map[string]any{
-		"general.architecture":             "llama",
-		"general.name":                     "test-llama-7b",
-		"llama.block_count":                uint32(32),
-		"llama.embedding_length":           uint32(4096),
-		"llama.attention.head_count":       uint32(32),
-		"llama.attention.head_count_kv":    uint32(32),
-		"llama.context_length":             uint32(2048),
+		"general.architecture":          "llama",
+		"general.name":                  "test-llama-7b",
+		"llama.block_count":             uint32(32),
+		"llama.embedding_length":        uint32(4096),
+		"llama.feed_forward_length":     uint32(11008),
+		"llama.attention.head_count":    uint32(32),
+		"llama.attention.head_count_kv": uint32(32),
+		"llama.context_length":          uint32(2048),
+		"tokenizer.ggml.bos_token_id":   uint32(1),
+		"tokenizer.ggml.eos_token_id":   uint32(2),
 	})
 
 	loader := &GGUFLoader{}
@@ -76,6 +79,9 @@ func TestGGUFLoaderParsesMetadata(t *testing.T) {
 	if meta.HiddenSize != 4096 {
 		t.Fatalf("expected hidden 4096, got %d", meta.HiddenSize)
 	}
+	if meta.IntermediateSize != 11008 {
+		t.Fatalf("expected intermediate 11008, got %d", meta.IntermediateSize)
+	}
 	if meta.NumHeads != 32 {
 		t.Fatalf("expected 32 heads, got %d", meta.NumHeads)
 	}
@@ -84,6 +90,9 @@ func TestGGUFLoaderParsesMetadata(t *testing.T) {
 	}
 	if meta.MaxSeqLen != 2048 {
 		t.Fatalf("expected max seq 2048, got %d", meta.MaxSeqLen)
+	}
+	if meta.BOSTokenID != 1 || meta.EOSTokenID != 2 {
+		t.Fatalf("expected BOS/EOS 1/2, got %d/%d", meta.BOSTokenID, meta.EOSTokenID)
 	}
 }
 
@@ -165,7 +174,7 @@ func writeGGUFv3WithTensors(t *testing.T, kv map[string]any, tensors []struct {
 
 func TestLoadGGUFWeights(t *testing.T) {
 	// Create a minimal GGUF file with 2 F32 tensors.
-	tensorData1 := make([]byte, 4*4) // [4] F32
+	tensorData1 := make([]byte, 4*4)   // [4] F32
 	tensorData2 := make([]byte, 2*3*4) // [2,3] F32
 	// Write known values.
 	for i := 0; i < 4; i++ {
@@ -247,5 +256,28 @@ func TestLoadGGUFWeightsQuantizedError(t *testing.T) {
 	_, _, err := LoadGGUFWeights(path)
 	if err == nil {
 		t.Fatal("expected error for quantized tensor")
+	}
+}
+
+func TestNormalizeGGUFTensorName(t *testing.T) {
+	cases := map[string]string{
+		"token_embd.weight":        "model.embed_tokens.weight",
+		"output_norm.weight":       "model.norm.weight",
+		"output.weight":            "lm_head.weight",
+		"blk.0.attn_norm.weight":   "model.layers.0.input_layernorm.weight",
+		"blk.3.attn_q.weight":      "model.layers.3.self_attn.q_proj.weight",
+		"blk.3.attn_k.weight":      "model.layers.3.self_attn.k_proj.weight",
+		"blk.3.attn_v.weight":      "model.layers.3.self_attn.v_proj.weight",
+		"blk.3.attn_output.weight": "model.layers.3.self_attn.o_proj.weight",
+		"blk.3.ffn_norm.weight":    "model.layers.3.post_attention_layernorm.weight",
+		"blk.3.ffn_gate.weight":    "model.layers.3.mlp.gate_proj.weight",
+		"blk.3.ffn_up.weight":      "model.layers.3.mlp.up_proj.weight",
+		"blk.3.ffn_down.weight":    "model.layers.3.mlp.down_proj.weight",
+		"some.other.weight":        "some.other.weight",
+	}
+	for input, want := range cases {
+		if got := normalizeGGUFTensorName(input); got != want {
+			t.Fatalf("normalizeGGUFTensorName(%q)=%q, want %q", input, got, want)
+		}
 	}
 }

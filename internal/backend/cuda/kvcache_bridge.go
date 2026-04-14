@@ -15,13 +15,15 @@ import (
 // CUDAKVCache wraps the GPU-resident KV cache.
 type CUDAKVCache struct {
 	handle     C.gollmgo_kvcache_t
+	numLayers  int
 	numSlots   int
+	blockSize  int
 	numKVHeads int
 	headDim    int
 }
 
 // NewCUDAKVCache creates a KV cache on the GPU.
-func NewCUDAKVCache(runner *CUDARunner, numLayers, numSlots, numKVHeads, headDim int) (*CUDAKVCache, error) {
+func NewCUDAKVCache(runner *CUDARunner, numLayers, numSlots, numKVHeads, headDim, blockSize int) (*CUDAKVCache, error) {
 	var handle C.gollmgo_kvcache_t
 	status := C.gollmgo_kvcache_create(
 		runner.handle,
@@ -36,7 +38,9 @@ func NewCUDAKVCache(runner *CUDARunner, numLayers, numSlots, numKVHeads, headDim
 	}
 	return &CUDAKVCache{
 		handle:     handle,
+		numLayers:  numLayers,
 		numSlots:   numSlots,
+		blockSize:  blockSize,
 		numKVHeads: numKVHeads,
 		headDim:    headDim,
 	}, nil

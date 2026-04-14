@@ -111,3 +111,12 @@ func TestValidateSpeculativeModeRejected(t *testing.T) {
 		t.Fatal("expected ErrInvalidSpeculativeMode")
 	}
 }
+
+func TestValidateSpeculativeDraftModeRejected(t *testing.T) {
+	c := DefaultConfig()
+	c.Speculative.Enabled = true
+	c.Speculative.Mode = "draft"
+	if !errors.Is(c.Validate(), ErrInvalidSpeculativeMode) {
+		t.Fatal("expected ErrInvalidSpeculativeMode for draft mode")
+	}
+}

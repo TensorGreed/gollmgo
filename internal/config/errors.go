@@ -11,7 +11,7 @@ var (
 	ErrInvalidPreemptMode      = errors.New("config: preempt_mode must be one of recompute, swap")
 	ErrAutoPreemptRequiresPrio = errors.New("config: auto_preempt requires scheduler_policy=priority")
 	ErrInvalidPrefixCacheCap   = errors.New("config: prefix_cache_max_blocks must be non-negative")
-	ErrInvalidSpeculativeMode  = errors.New("config: speculative.mode must be one of ngram, draft")
+	ErrInvalidSpeculativeMode  = errors.New("config: speculative.mode must be \"ngram\"")
 	ErrInvalidNGramSize        = errors.New("config: speculative.ngram_size must be >= 2")
 	ErrInvalidNumDraftTokens   = errors.New("config: speculative.num_draft_tokens must be positive")
 )

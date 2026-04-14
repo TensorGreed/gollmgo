@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"strings"
 
 	"github.com/TensorGreed/gollmgo/internal/backend"
 	"github.com/TensorGreed/gollmgo/internal/backend/cuda"
@@ -23,19 +24,69 @@ import (
 func initGPURunner(log *slog.Logger, cfg config.Config, handle *hfhub.Handle, deviceID int) (backend.Runner, model.Tokenizer, int, error) {
 	tokenizerPath := cfg.TokenizerPath
 	dir := handle.LocalDir
+	weightsPath := cfg.ModelPath
+	if len(handle.WeightsFiles) > 0 {
+		weightsPath = handle.WeightsFiles[0]
+	}
+	weightsFormat := strings.ToLower(filepath.Ext(weightsPath))
 	log.Info("initializing GPU runner", "model_dir", dir, "device", deviceID,
-		"repo", handle.RepoID, "sharded", handle.IsSharded, "shards", len(handle.WeightsFiles))
+		"repo", handle.RepoID, "sharded", handle.IsSharded, "shards", len(handle.WeightsFiles),
+		"format", weightsFormat)
 
-	// --- Load config.json for authoritative model metadata ---
-	configPath := handle.ConfigPath
-	if configPath == "" {
-		configPath = filepath.Join(dir, "config.json")
+	var (
+		err              error
+		meta             *model.ModelMeta
+		tensors          []model.WeightTensor
+		intermediateSize int
+		eosTokenID       int32 = 2
+	)
+
+	switch weightsFormat {
+	case ".gguf":
+		tensors, meta, err = model.LoadGGUFWeights(weightsPath)
+		if err != nil {
+			return nil, nil, 0, fmt.Errorf("load GGUF weights: %w", err)
+		}
+		if meta.IntermediateSize <= 0 {
+			return nil, nil, 0, fmt.Errorf("GGUF metadata missing %s.feed_forward_length", meta.Family)
+		}
+		intermediateSize = meta.IntermediateSize
+		if meta.EOSTokenID != 0 {
+			eosTokenID = meta.EOSTokenID
+		}
+	default:
+		// --- Load config.json for authoritative model metadata ---
+		configPath := handle.ConfigPath
+		if configPath == "" {
+			configPath = filepath.Join(dir, "config.json")
+		}
+		hfCfg, err := model.LoadHFConfig(configPath)
+		if err != nil {
+			return nil, nil, 0, fmt.Errorf("load config.json: %w", err)
+		}
+		meta = hfCfg.ToModelMeta()
+		intermediateSize = hfCfg.IntermediateSize
+		if meta.EOSTokenID != 0 {
+			eosTokenID = meta.EOSTokenID
+		}
+
+		// --- Load weights. Handle both single-file and sharded layouts. ---
+		log.Info("loading model weights", "dir", dir)
+		if handle.IsSharded || len(handle.WeightsFiles) > 1 {
+			tensors, _, err = model.LoadSafetensorsDirectory(dir)
+		} else if len(handle.WeightsFiles) == 1 {
+			tensors, _, err = model.LoadSafetensorsWeights(handle.WeightsFiles[0])
+		} else {
+			// Backwards-compat: caller passed a single-file ModelPath directly.
+			tensors, _, err = model.LoadSafetensorsWeights(cfg.ModelPath)
+		}
+		if err != nil {
+			return nil, nil, 0, fmt.Errorf("load weights: %w", err)
+		}
 	}
-	hfCfg, err := model.LoadHFConfig(configPath)
-	if err != nil {
-		return nil, nil, 0, fmt.Errorf("load config.json: %w", err)
+	if meta.NumKVHeads == 0 {
+		meta.NumKVHeads = meta.NumHeads
 	}
-	meta := hfCfg.ToModelMeta()
 
 	log.Info("model config",
 		"family", meta.Family,
@@ -59,26 +110,10 @@ func initGPURunner(log *slog.Logger, cfg config.Config, handle *hfhub.Handle, de
 		"compute", fmt.Sprintf("%d.%d", info.ComputeMajor, info.ComputeMinor),
 		"total_gb", fmt.Sprintf("%.1f", float64(info.TotalMemoryBytes)/(1<<30)),
 		"free_gb", fmt.Sprintf("%.1f", float64(info.FreeMemoryBytes)/(1<<30)))
-
-	// --- Load weights. Handle both single-file and sharded layouts. ---
-	log.Info("loading model weights", "dir", dir)
-	var tensors []model.WeightTensor
-	if handle.IsSharded || len(handle.WeightsFiles) > 1 {
-		tensors, _, err = model.LoadSafetensorsDirectory(dir)
-	} else if len(handle.WeightsFiles) == 1 {
-		tensors, _, err = model.LoadSafetensorsWeights(handle.WeightsFiles[0])
-	} else {
-		// Backwards-compat: caller passed a single-file ModelPath directly.
-		tensors, _, err = model.LoadSafetensorsWeights(cfg.ModelPath)
-	}
-	if err != nil {
-		runner.Close()
-		return nil, nil, 0, fmt.Errorf("load weights: %w", err)
-	}
 	log.Info("weight tensors loaded", "count", len(tensors))
 
 	// --- Create CUDA model ---
-	cudaModel, err := cuda.LoadModel(runner, meta, hfCfg.IntermediateSize, cfg.Quantization)
+	cudaModel, err := cuda.LoadModel(runner, meta, intermediateSize, cfg.Quantization)
 	if err != nil {
 		runner.Close()
 		return nil, nil, 0, fmt.Errorf("create CUDA model: %w", err)
@@ -117,7 +152,7 @@ func initGPURunner(log *slog.Logger, cfg config.Config, handle *hfhub.Handle, de
 	headDim := meta.HiddenSize / meta.NumHeads
 	// Each KV block stores block_size tokens × num_kv_heads × head_dim × 2 bytes (FP16/BF16)
 	// for both K and V, across all layers.
-	bytesPerBlock := int64(blockSize) * int64(hfCfg.NumKeyValueHeads) * int64(headDim) * 2 * 2 * int64(meta.NumLayers)
+	bytesPerBlock := int64(blockSize) * int64(meta.NumKVHeads) * int64(headDim) * 2 * 2 * int64(meta.NumLayers)
 
 	// Compute model weight memory from uploaded tensors.
 	var weightBytes int64
@@ -149,13 +184,13 @@ func initGPURunner(log *slog.Logger, cfg config.Config, handle *hfhub.Handle, de
 		"num_blocks", numBlocks,
 		"num_slots", numSlots)
 
-	kvCache, err := cuda.NewCUDAKVCache(runner, meta.NumLayers, numSlots, hfCfg.NumKeyValueHeads, headDim)
+	kvCache, err := cuda.NewCUDAKVCache(runner, meta.NumLayers, numSlots, meta.NumKVHeads, headDim, blockSize)
 	if err != nil {
 		cudaModel.Close()
 		runner.Close()
 		return nil, nil, 0, fmt.Errorf("create KV cache: %w", err)
 	}
-	log.Info("GPU KV cache created", "slots", numSlots, "kv_heads", hfCfg.NumKeyValueHeads, "head_dim", headDim)
+	log.Info("GPU KV cache created", "slots", numSlots, "kv_heads", meta.NumKVHeads, "head_dim", headDim)
 
 	// --- Build runner with model + KV cache ---
 	fullRunner := &cuda.CUDARunnerWithModel{
@@ -177,7 +212,7 @@ func initGPURunner(log *slog.Logger, cfg config.Config, handle *hfhub.Handle, de
 	hfTok, err := model.LoadHFTokenizer(tokenizerPath, "</s>", "<s>")
 	if err != nil {
 		log.Warn("HF tokenizer failed, using byte-level fallback", "error", err)
-		tokenizer = model.NewByteLevelTokenizer(meta.VocabSize, int32(hfCfg.EosTokenID))
+		tokenizer = model.NewByteLevelTokenizer(meta.VocabSize, eosTokenID)
 	} else {
 		tokenizer = hfTok
 		log.Info("tokenizer loaded", "vocab", hfTok.VocabSize(), "eos", hfTok.EOSTokenID())

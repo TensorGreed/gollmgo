@@ -53,7 +53,7 @@ type Config struct {
 // SpeculativeConfig controls speculative decoding behavior.
 type SpeculativeConfig struct {
 	Enabled        bool    `json:"enabled"`
-	Mode           string  `json:"mode"`             // "ngram" or "draft"
+	Mode           string  `json:"mode"`             // "ngram"
 	NGramSize      int     `json:"ngram_size"`       // default 3
 	NumDraftTokens int     `json:"num_draft_tokens"` // K, default 4
 	KillThreshold  float64 `json:"kill_threshold"`   // auto-disable below this acceptance rate
@@ -110,9 +110,6 @@ func (c *Config) Validate() error {
 	if c.Speculative.Enabled {
 		switch strings.ToLower(strings.TrimSpace(c.Speculative.Mode)) {
 		case "", "ngram":
-			// draft mode is reserved for future work (needs a draft model).
-		case "draft":
-			// Accepted syntactically; engine may gate on runner capability.
 		default:
 			return ErrInvalidSpeculativeMode
 		}
