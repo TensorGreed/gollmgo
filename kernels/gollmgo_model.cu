@@ -16,6 +16,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp8.h>
 #include <cstring>
+#include <cstdint>
 #include <cstdio>
 #include <string>
 #include <unordered_map>
@@ -32,6 +33,8 @@ struct gollmgo_model {
     gollmgo_model_config_t config;
     gollmgo_backend_t      backend;
     cublasHandle_t         cublas;
+    void*                  cublas_workspace;
+    size_t                 cublas_workspace_size;
     bool                   ready;
     char                   last_error[512];
 
@@ -64,8 +67,8 @@ struct gollmgo_model {
     int32_t* paged_d_seq_lens;      /* [max_batch] */
     int32_t* paged_d_slot_tables;   /* [max_batch * max_seq_len] */
 
-    /* CUDA graph cache: batch_size → instantiated graph. */
-    std::unordered_map<int, cudaGraphExec_t> graph_cache;
+    /* CUDA graph cache: (batch_size,max_context_len) → instantiated graph. */
+    std::unordered_map<uint64_t, cudaGraphExec_t> graph_cache;
     int graph_max_context_len; /* max_context_len used during graph capture */
     int64_t graph_hits;        /* graph replay count */
     int64_t graph_lookups;     /* total forward_paged calls */
@@ -95,6 +98,11 @@ static void* get_weight(gollmgo_model_t m, const std::string& name) {
     auto it = m->weights.find(name);
     if (it == m->weights.end()) return nullptr;
     return it->second.data;
+}
+
+static uint64_t graph_cache_key(int batch_size, int max_context_len) {
+    return (static_cast<uint64_t>(static_cast<uint32_t>(batch_size)) << 32) |
+           static_cast<uint32_t>(max_context_len);
 }
 
 /* ---- cuBLAS GEMM helpers ---- */
@@ -337,6 +345,8 @@ gollmgo_status_t gollmgo_model_create(gollmgo_backend_t b,
     m->graph_max_context_len = 0;
     m->graph_hits = 0;
     m->graph_lookups = 0;
+    m->cublas_workspace = nullptr;
+    m->cublas_workspace_size = 0;
     m->buf_v2_exp_sums = nullptr;
     m->buf_v2_max_logits = nullptr;
     m->buf_v2_partial_out = nullptr;
@@ -347,6 +357,17 @@ gollmgo_status_t gollmgo_model_create(gollmgo_backend_t b,
     if (cstat != CUBLAS_STATUS_SUCCESS) {
         delete m;
         return GOLLMGO_ERR_CUDA;
+    }
+    cublasSetStream(m->cublas, 0);
+
+    /* Give cuBLAS a dedicated workspace so graph capture doesn't depend on
+     * internal lazy allocations on the first decode of a new GEMM shape. */
+    m->cublas_workspace_size = 32u << 20;
+    if (cudaMalloc(&m->cublas_workspace, m->cublas_workspace_size) == cudaSuccess) {
+        cublasSetWorkspace(m->cublas, m->cublas_workspace, m->cublas_workspace_size);
+    } else {
+        m->cublas_workspace = nullptr;
+        m->cublas_workspace_size = 0;
     }
 
     *out = m;
@@ -958,12 +979,7 @@ gollmgo_status_t gollmgo_model_forward_paged(
     int N = n_tokens;
     gollmgo_status_t st;
 
-    /* Use pre-allocated buffers (no cudaMalloc in hot path).
-     * Pad max_context_len to the graph-captured size for graph replay compatibility. */
-    int padded_ctx = max_context_len;
-    if (padded_ctx > m->graph_max_context_len) {
-        padded_ctx = m->graph_max_context_len;
-    }
+    /* Use pre-allocated buffers (no cudaMalloc in hot path). */
 
     int32_t* d_token_ids = m->paged_d_token_ids;
     int32_t* d_positions = m->paged_d_positions;
@@ -987,20 +1003,25 @@ gollmgo_status_t gollmgo_model_forward_paged(
 
     /* Check for cached CUDA graph. */
     m->graph_lookups++;
-    auto it = m->graph_cache.find(N);
-    if (it != m->graph_cache.end() && max_context_len <= m->graph_max_context_len) {
+    const bool graph_eligible = (N <= 64) &&
+                                (max_context_len > 0) &&
+                                (max_context_len <= m->graph_max_context_len);
+    const uint64_t graph_key = graph_cache_key(N, max_context_len);
+    auto it = m->graph_cache.find(graph_key);
+    if (it != m->graph_cache.end() && graph_eligible) {
         /* Graph replay — skip kernel launches, just replay the captured graph. */
         m->graph_hits++;
         cudaGraphLaunch(it->second, 0 /* default stream */);
         cudaStreamSynchronize(0);
     } else {
         /* Eager path (also used for graph capture). */
-        bool should_capture = (it == m->graph_cache.end()) &&
-                              (N <= 64) && /* only cache common decode batch sizes */
-                              (max_context_len <= m->graph_max_context_len);
+        bool should_capture = (it == m->graph_cache.end()) && graph_eligible;
         cudaGraph_t graph = nullptr;
         if (should_capture) {
-            cudaStreamBeginCapture(0, cudaStreamCaptureModeRelaxed);
+            cudaError_t capture_err = cudaStreamBeginCapture(0, cudaStreamCaptureModeRelaxed);
+            if (capture_err != cudaSuccess) {
+                should_capture = false;
+            }
         }
 
         run_embedding(m, d_token_ids, N);
@@ -1019,12 +1040,14 @@ gollmgo_status_t gollmgo_model_forward_paged(
         run_lm_head_device(m, N);
 
         if (should_capture) {
-            cudaStreamEndCapture(0, &graph);
-            if (graph) {
+            cudaError_t capture_err = cudaStreamEndCapture(0, &graph);
+            if (capture_err == cudaSuccess && graph) {
                 cudaGraphExec_t exec = nullptr;
                 if (cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0) == cudaSuccess && exec) {
-                    m->graph_cache[N] = exec;
+                    m->graph_cache[graph_key] = exec;
                 }
+                cudaGraphDestroy(graph);
+            } else if (graph) {
                 cudaGraphDestroy(graph);
             }
         }
@@ -1083,6 +1106,7 @@ gollmgo_status_t gollmgo_model_destroy(gollmgo_model_t m) {
     if (m->cublas) {
         cublasDestroy(m->cublas);
     }
+    cudaFree(m->cublas_workspace);
 
     delete m;
     return GOLLMGO_OK;

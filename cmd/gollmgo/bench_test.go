@@ -62,11 +62,8 @@ func TestCollectStreamMetricsTokenizerAware(t *testing.T) {
 	if tokens != 3 {
 		t.Fatalf("expected 3 tokens, got %d", tokens)
 	}
-	if len(itls) != 2 {
-		t.Fatalf("expected 2 ITL entries, got %d", len(itls))
-	}
-	if itls[0] != 0 {
-		t.Fatalf("expected zero-width ITL for second token in the first chunk, got %v", itls[0])
+	if len(itls) != 1 {
+		t.Fatalf("expected 1 ITL entry, got %d", len(itls))
 	}
 }
 

@@ -506,7 +506,7 @@ func collectStreamMetrics(body io.Reader, reqStart time.Time, tok model.Tokenize
 	var (
 		ttft          time.Duration
 		itls          []time.Duration
-		lastTokenTime = reqStart
+		lastChunkTime = reqStart
 		firstToken    = true
 		totalTokens   int
 		outputText    strings.Builder
@@ -533,6 +533,14 @@ func collectStreamMetrics(body io.Reader, reqStart time.Time, tok model.Tokenize
 		}
 
 		now := time.Now()
+		if firstToken {
+			ttft = now.Sub(reqStart)
+			firstToken = false
+		} else {
+			itls = append(itls, now.Sub(lastChunkTime))
+		}
+		lastChunkTime = now
+
 		deltaTokens := 1
 		if tok != nil {
 			outputText.WriteString(content)
@@ -544,22 +552,9 @@ func collectStreamMetrics(body io.Reader, reqStart time.Time, tok model.Tokenize
 			if deltaTokens < 0 {
 				return 0, nil, 0, fmt.Errorf("benchmark: token count went backwards")
 			}
-			if deltaTokens == 0 {
-				continue
-			}
 		}
-
-		for i := 0; i < deltaTokens; i++ {
-			if firstToken {
-				ttft = now.Sub(reqStart)
-				firstToken = false
-			} else if i == 0 {
-				itls = append(itls, now.Sub(lastTokenTime))
-			} else {
-				itls = append(itls, 0)
-			}
-			lastTokenTime = now
-			totalTokens++
+		if deltaTokens > 0 {
+			totalTokens += deltaTokens
 		}
 	}
 

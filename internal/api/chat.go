@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/TensorGreed/gollmgo/internal/engine"
 	"github.com/TensorGreed/gollmgo/internal/metrics"
+	"github.com/TensorGreed/gollmgo/internal/model"
 )
 
 // --- OpenAI-compatible request/response types ---
@@ -258,6 +260,8 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request, req *ChatC
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
 
+	streamer := newStreamDetokenizer(s.tokenizer)
+
 	// Send initial role chunk.
 	writeSSE(w, flusher, StreamChunk{
 		ID:      engineReq.ID,
@@ -302,7 +306,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request, req *ChatC
 				sendFinish("error")
 				return
 			}
-			content := s.detokenize([]int32{tok.TokenID})
+			content := streamer.Push(tok.TokenID)
 			if tok.Finished {
 				// Final content token + finish_reason in same chunk.
 				stop := "stop"
@@ -321,6 +325,9 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request, req *ChatC
 				flusher.Flush()
 				return
 			}
+			if content == "" {
+				continue
+			}
 			writeSSE(w, flusher, StreamChunk{
 				ID:      engineReq.ID,
 				Object:  "chat.completion.chunk",
@@ -333,6 +340,52 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request, req *ChatC
 			})
 		}
 	}
+}
+
+type streamDetokenizer struct {
+	tokenizer model.Tokenizer
+	tokens    []int32
+	emitted   string
+}
+
+func newStreamDetokenizer(tok model.Tokenizer) *streamDetokenizer {
+	return &streamDetokenizer{tokenizer: tok}
+}
+
+// Push returns the newly materialized text delta after appending tokenID.
+// We detokenize the cumulative token stream so emitted deltas stay aligned
+// with the tokenizer's real text progression.
+func (d *streamDetokenizer) Push(tokenID int32) string {
+	d.tokens = append(d.tokens, tokenID)
+	text, err := d.tokenizer.Decode(d.tokens)
+	if err != nil {
+		return ""
+	}
+	if strings.HasPrefix(text, d.emitted) {
+		delta := text[len(d.emitted):]
+		d.emitted = text
+		return delta
+	}
+
+	// Best-effort fallback if a tokenizer's cumulative decode rewrites a
+	// previous boundary. This keeps the stream moving without duplicating the
+	// entire decoded prefix.
+	common := commonPrefixLen(d.emitted, text)
+	delta := text[common:]
+	d.emitted = text
+	return delta
+}
+
+func commonPrefixLen(a, b string) int {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	i := 0
+	for i < n && a[i] == b[i] {
+		i++
+	}
+	return i
 }
 
 // --- Helpers ---

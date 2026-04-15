@@ -25,6 +25,25 @@ func newTestServer(t *testing.T) (*Server, *engine.MockEngine) {
 	return NewServer(cfg, eng, tok, log, "test-model"), eng
 }
 
+type cumulativeDecodeTokenizer struct {
+	*model.ByteLevelTokenizer
+}
+
+func (t *cumulativeDecodeTokenizer) Decode(ids []int32) (string, error) {
+	if len(ids) == 1 {
+		switch ids[0] {
+		case 65:
+			return "A", nil
+		case 66:
+			return "", nil
+		}
+	}
+	if len(ids) == 2 && ids[0] == 65 && ids[1] == 66 {
+		return "AB", nil
+	}
+	return t.ByteLevelTokenizer.Decode(ids)
+}
+
 // --- Health endpoints ---
 
 func TestServerLive(t *testing.T) {
@@ -167,7 +186,7 @@ func TestChatCompletionsNonStreaming(t *testing.T) {
 		ids := eng.PendingRequestIDs()
 		eng.PushResultsTo(ids[0], []engine.TokenResult{
 			{SequenceID: 1, TokenID: 72, Finished: false}, // 'H'
-			{SequenceID: 1, TokenID: 105, Finished: true},  // 'i'
+			{SequenceID: 1, TokenID: 105, Finished: true}, // 'i'
 		})
 	}()
 
@@ -219,6 +238,42 @@ func TestChatCompletionsStreaming(t *testing.T) {
 	}
 	if !strings.Contains(respBody, "data: [DONE]") {
 		t.Fatal("expected [DONE] sentinel")
+	}
+}
+
+func TestChatCompletionsStreamingUsesCumulativeDecode(t *testing.T) {
+	eng := &engine.MockEngine{}
+	cfg := config.DefaultConfig()
+	tok := &cumulativeDecodeTokenizer{ByteLevelTokenizer: model.NewByteLevelTokenizer(256, 2)}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	s := NewServer(cfg, eng, tok, log, "test-model")
+
+	body := `{"model":"test","messages":[{"role":"user","content":"go"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	go func() {
+		for len(eng.PendingRequestIDs()) == 0 {
+		}
+		ids := eng.PendingRequestIDs()
+		eng.PushResultsTo(ids[0], []engine.TokenResult{
+			{SequenceID: 1, TokenID: 65, Finished: false},
+			{SequenceID: 1, TokenID: 66, Finished: true},
+		})
+	}()
+
+	s.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	respBody := rec.Body.String()
+	if !strings.Contains(respBody, `"content":"A"`) {
+		t.Fatalf("expected first streamed delta in body: %s", respBody)
+	}
+	if !strings.Contains(respBody, `"content":"B"`) {
+		t.Fatalf("expected cumulative decode suffix in body: %s", respBody)
 	}
 }
 
